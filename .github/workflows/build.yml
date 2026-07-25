@@ -85,7 +85,14 @@ jobs:
     name: GitHub Release
     needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Релиз: push в main/master, тег v*, или ручной запуск. Не на PR.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/master' ||
+        startsWith(github.ref, 'refs/tags/v')
+      ))
     permissions:
       contents: write
     steps:
@@ -101,14 +108,44 @@ jobs:
           name: MineLauncher-linux-x64
           path: release
 
-      - name: Rename Windows exe for release
-        run: mv release/MineLauncher.exe release/MineLauncher-windows-x64.exe
+      - name: Prepare files
+        run: |
+          mv release/MineLauncher.exe release/MineLauncher-windows-x64.exe
+          ls -lh release/
 
-      - name: Create GitHub Release
+      - name: Resolve release tag and title
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "name=MineLauncher ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "name=Latest Build" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          generate_release_notes: true
+          make_latest: true
           files: |
             release/MineLauncher-windows-x64.exe
             release/MineLauncher-linux-x64
-          generate_release_notes: true
           fail_on_unmatched_files: true
+          body: |
+            Автоматическая сборка MineLauncher.
+
+            | Файл | Платформа |
+            |------|-----------|
+            | `MineLauncher-windows-x64.exe` | Windows |
+            | `MineLauncher-linux-x64` | Linux |
+
+            Commit: `${{ github.sha }}`
