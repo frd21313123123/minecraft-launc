@@ -1,5 +1,9 @@
 /target/
+/dist/
 **/*.rs.bk
 .idea/
 .vscode/
 *.pdb
+*.exe
+MineLauncher
+MineLauncher-linux-x64
