@@ -324,41 +324,165 @@ fn list_folder_files(
 fn parse_drive_html(html: &str) -> Vec<DriveFile> {
     let mut files = Vec::new();
 
-    // Типичный фрагмент: ["MyPack.zip",null,"application/zip",... ,"FILE_ID",...]
-    // Ищем пары name + mime + id.
-    // Паттерн: "filename.ext" рядом с mime и 25–44-символьным id.
-    let re_entry = regex_lite::Regex::new(
-        r#"\["([^"]+\.(?:zip|json|jar|txt|mrpack))",null,"(application/[^"]+|text/[^"]+)"[^]]*?,"([a-zA-Z0-9_-]{25,44})""#,
-    )
-    .ok();
+    // 1) Современный payload: window['_DRIVE_ivd'] = '\x5b\x5b\x5b\x22FILE_ID\x22,...'
+    //    После декодирования: [["FILE_ID",["FOLDER_ID"],"name.zip","application/...",...
+    files.extend(parse_drive_ivd(html));
 
-    if let Some(re) = re_entry {
-        for cap in re.captures_iter(html) {
-            let name = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
-            let mime = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
-            let id = cap.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
-            if !name.is_empty() && !id.is_empty() && id != DRIVE_FOLDER_ID {
-                files.push(DriveFile {
-                    id,
-                    name: decode_js_string(&name),
-                    mime,
-                    size: None,
-                });
+    // 2) Старый JSON-подобный фрагмент: ["MyPack.zip",null,"application/zip",... ,"FILE_ID"]
+    if files.is_empty() {
+        if let Ok(re) = regex_lite::Regex::new(
+            r#"\["([^"]+\.(?:zip|json|jar|txt|mrpack))",null,"(application/[^"]+|text/[^"]+)"[^]]*?,"([a-zA-Z0-9_-]{25,44})""#,
+        ) {
+            for cap in re.captures_iter(html) {
+                let name = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                let mime = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+                let id = cap.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+                if !name.is_empty() && !id.is_empty() && id != DRIVE_FOLDER_ID {
+                    files.push(DriveFile {
+                        id,
+                        name: decode_js_string(&name),
+                        mime,
+                        size: None,
+                    });
+                }
             }
         }
     }
 
-    // Более свободный паттерн: имя файла + id
+    // 3) DOM: data-id="..." data-tooltip="file.zip ..." / aria-label="..."
     if files.is_empty() {
-        let re2 = regex_lite::Regex::new(
-            r#"\\x22([^\\"]+\.(?:zip|json|jar|mrpack))\\x22[^\\]{0,200}?\\x22([a-zA-Z0-9_-]{25,44})\\x22"#,
-        )
-        .ok();
-        if let Some(re) = re2 {
+        if let Ok(re) = regex_lite::Regex::new(
+            r#"data-id="([a-zA-Z0-9_-]{25,44})"[^>]{0,400}?(?:data-tooltip|aria-label|aria-labelledby)="([^"]+)""#,
+        ) {
             for cap in re.captures_iter(html) {
-                let name = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                let label = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                if id == DRIVE_FOLDER_ID {
+                    continue;
+                }
+                if let Some(name) = filename_from_label(label) {
+                    files.push(DriveFile {
+                        id,
+                        name,
+                        mime: String::new(),
+                        size: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // 4) DOM: aria-label / data-tooltip перед data-id (порядок атрибутов другой)
+    if files.is_empty() {
+        if let Ok(re) = regex_lite::Regex::new(
+            r#"(?:data-tooltip|aria-label)="([^"]+)"[^>]{0,400}?data-id="([a-zA-Z0-9_-]{25,44})""#,
+        ) {
+            for cap in re.captures_iter(html) {
+                let label = cap.get(1).map(|m| m.as_str()).unwrap_or("");
                 let id = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
-                if !name.is_empty() && id != DRIVE_FOLDER_ID {
+                if id == DRIVE_FOLDER_ID {
+                    continue;
+                }
+                if let Some(name) = filename_from_label(label) {
+                    files.push(DriveFile {
+                        id,
+                        name,
+                        mime: String::new(),
+                        size: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // 5) ssk='...:FILE_ID-...' рядом с aria-label / title
+    if files.is_empty() {
+        if let Ok(re) = regex_lite::Regex::new(
+            r#"aria-label="([^"]+)"[^>]{0,200}?ssk='[^']*:([a-zA-Z0-9_-]{25,44})-"#,
+        ) {
+            for cap in re.captures_iter(html) {
+                let label = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                let id = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+                if id == DRIVE_FOLDER_ID {
+                    continue;
+                }
+                if let Some(name) = filename_from_label(label) {
+                    files.push(DriveFile {
+                        id,
+                        name,
+                        mime: String::new(),
+                        size: None,
+                    });
+                }
+            }
+        }
+    }
+
+    files
+}
+
+/// Парсит `window['_DRIVE_ivd']` — основной источник списка файлов в публичной папке.
+fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
+    let mut files = Vec::new();
+
+    // Ищем payload (одинарные кавычки вокруг \x.. строки).
+    let Some(start_marker) = html.find("_DRIVE_ivd") else {
+        return files;
+    };
+    let rest = &html[start_marker..];
+    let Some(eq) = rest.find('=') else {
+        return files;
+    };
+    let after_eq = rest[eq + 1..].trim_start();
+    let quote = after_eq.chars().next().unwrap_or('\0');
+    if quote != '\'' && quote != '"' {
+        return files;
+    }
+    let body = &after_eq[1..];
+    let Some(end) = body.find(quote) else {
+        return files;
+    };
+    let encoded = &body[..end];
+    let decoded = decode_js_hex_escapes(encoded);
+
+    // ["FILE_ID",["FOLDER_ID"],"name.ext","mime/type"
+    // id может быть 25–44 символа (Drive file ids).
+    let Ok(re) = regex_lite::Regex::new(
+        r#"\["([a-zA-Z0-9_-]{25,44})",\["([a-zA-Z0-9_-]{25,44})"\],"([^"]+\.(?:zip|json|jar|txt|mrpack))","([^"]*)""#,
+    ) else {
+        return files;
+    };
+
+    for cap in re.captures_iter(&decoded) {
+        let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+        let parent = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let name = cap.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+        let mime = cap
+            .get(4)
+            .map(|m| m.as_str().replace("\\/", "/"))
+            .unwrap_or_default();
+        if id.is_empty() || id == DRIVE_FOLDER_ID || name.is_empty() {
+            continue;
+        }
+        // parent обычно = id папки; если нет — всё равно берём файл.
+        let _ = parent;
+        files.push(DriveFile {
+            id,
+            name: decode_js_string(&name),
+            mime,
+            size: None,
+        });
+    }
+
+    // Запасной паттерн без mime / folder: "FILE_ID" ... "name.zip"
+    if files.is_empty() {
+        if let Ok(re2) = regex_lite::Regex::new(
+            r#""([a-zA-Z0-9_-]{25,44})"[^"]{0,80}"([^"]+\.(?:zip|json|jar|txt|mrpack))""#,
+        ) {
+            for cap in re2.captures_iter(&decoded) {
+                let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                let name = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+                if id != DRIVE_FOLDER_ID && !name.is_empty() {
                     files.push(DriveFile {
                         id,
                         name: decode_js_string(&name),
@@ -370,16 +494,69 @@ fn parse_drive_html(html: &str) -> Vec<DriveFile> {
         }
     }
 
-    // data-id + title style
+    files
+}
+
+fn parse_embedded_folder(html: &str) -> Vec<DriveFile> {
+    let mut files = Vec::new();
+
+    // Современный embeddedfolderview:
+    // <div class="flip-entry" id="entry-FILEID" ...>
+    //   <a href=".../file/d/FILEID/..."> ... <div class="flip-entry-title">name.zip</div>
+    if let Ok(re) = regex_lite::Regex::new(
+        r#"id="entry-([a-zA-Z0-9_-]{25,44})"[^>]*>[\s\S]{0,2500}?flip-entry-title">([^<]+)<"#,
+    ) {
+        for cap in re.captures_iter(html) {
+            let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            let name = cap
+                .get(2)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
+            if id != DRIVE_FOLDER_ID && looks_like_build_file(&name) {
+                files.push(DriveFile {
+                    id,
+                    name,
+                    mime: String::new(),
+                    size: None,
+                });
+            }
+        }
+    }
+
+    // Старый формат: <a href=".../file/d/ID/...">name</a>
     if files.is_empty() {
-        let re3 = regex_lite::Regex::new(
-            r#"data-id="([a-zA-Z0-9_-]{25,44})"[^>]{0,300}?aria-label="([^"]+)""#,
-        )
-        .ok();
-        if let Some(re) = re3 {
+        if let Ok(re) = regex_lite::Regex::new(
+            r#"/file/d/([a-zA-Z0-9_-]{25,44})/[^"]*"[^>]*>([^<]+)<"#,
+        ) {
             for cap in re.captures_iter(html) {
                 let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
-                let name = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+                let name = cap
+                    .get(2)
+                    .map(|m| m.as_str().trim().to_string())
+                    .unwrap_or_default();
+                if looks_like_build_file(&name) {
+                    files.push(DriveFile {
+                        id,
+                        name,
+                        mime: String::new(),
+                        size: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // href + flip-entry-title рядом
+    if files.is_empty() {
+        if let Ok(re) = regex_lite::Regex::new(
+            r#"/file/d/([a-zA-Z0-9_-]{25,44})/[^"]*"[\s\S]{0,2000}?flip-entry-title">([^<]+)<"#,
+        ) {
+            for cap in re.captures_iter(html) {
+                let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+                let name = cap
+                    .get(2)
+                    .map(|m| m.as_str().trim().to_string())
+                    .unwrap_or_default();
                 if id != DRIVE_FOLDER_ID && looks_like_build_file(&name) {
                     files.push(DriveFile {
                         id,
@@ -395,30 +572,6 @@ fn parse_drive_html(html: &str) -> Vec<DriveFile> {
     files
 }
 
-fn parse_embedded_folder(html: &str) -> Vec<DriveFile> {
-    let mut files = Vec::new();
-    // <a href=".../file/d/ID/...">name</a>
-    let re = match regex_lite::Regex::new(
-        r#"/file/d/([a-zA-Z0-9_-]{25,44})/[^"]*"[^>]*>([^<]+)<"#,
-    ) {
-        Ok(r) => r,
-        Err(_) => return files,
-    };
-    for cap in re.captures_iter(html) {
-        let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
-        let name = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("").to_string();
-        if looks_like_build_file(&name) {
-            files.push(DriveFile {
-                id,
-                name,
-                mime: String::new(),
-                size: None,
-            });
-        }
-    }
-    files
-}
-
 fn looks_like_build_file(name: &str) -> bool {
     let l = name.to_lowercase();
     l.ends_with(".zip")
@@ -428,10 +581,81 @@ fn looks_like_build_file(name: &str) -> bool {
         || l == "builds.json"
 }
 
+/// Из подписи Drive («createA2.zip Compressed archive Shared») вытаскивает имя файла.
+fn filename_from_label(label: &str) -> Option<String> {
+    let label = label.trim();
+    if looks_like_build_file(label) {
+        return Some(label.to_string());
+    }
+    for part in label.split_whitespace() {
+        if looks_like_build_file(part) {
+            return Some(part.to_string());
+        }
+    }
+    None
+}
+
 fn decode_js_string(s: &str) -> String {
     s.replace("\\u0026", "&")
         .replace("\\/", "/")
         .replace("\\\"", "\"")
+}
+
+/// Декодирует `\xNN` (и простые `\\`, `\/`) из JS-строки Drive payload.
+fn decode_js_hex_escapes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'x' | b'X' if i + 3 < bytes.len() => {
+                    let h1 = bytes[i + 2] as char;
+                    let h2 = bytes[i + 3] as char;
+                    if let (Some(a), Some(b)) = (h1.to_digit(16), h2.to_digit(16)) {
+                        out.push(char::from_u32((a << 4) | b).unwrap_or('?'));
+                        i += 4;
+                        continue;
+                    }
+                }
+                b'u' | b'U' if i + 5 < bytes.len() => {
+                    // \uXXXX
+                    let hex = &s[i + 2..i + 6];
+                    if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+                b'n' => {
+                    out.push('\n');
+                    i += 2;
+                    continue;
+                }
+                b'r' => {
+                    out.push('\r');
+                    i += 2;
+                    continue;
+                }
+                b't' => {
+                    out.push('\t');
+                    i += 2;
+                    continue;
+                }
+                b'\\' | b'/' | b'\'' | b'"' => {
+                    out.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn stem_id(filename: &str) -> String {
@@ -619,4 +843,59 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), LauncherError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_drive_ivd_modern_payload() {
+        let html = r#"
+        <script>window['_DRIVE_ivd'] = '\x5b\x5b\x5b\x221AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj\x22,\x5b\x221mEl5hfZqx5IUiS_gULZBz4v116YuHYtq\x22\x5d,\x22createA2.zip\x22,\x22application\/x-zip-compressed\x22,0,null';</script>
+        "#;
+        let files = parse_drive_html(html);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, "1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj");
+        assert_eq!(files[0].name, "createA2.zip");
+        assert!(files[0].mime.contains("zip"));
+    }
+
+    #[test]
+    fn parse_data_id_tooltip() {
+        let html = r#"
+        <div data-id="1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj" jsname="vtaz5c" data-tooltip="createA2.zip Compressed archive"></div>
+        "#;
+        let files = parse_drive_html(html);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "createA2.zip");
+        assert_eq!(files[0].id, "1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj");
+    }
+
+    #[test]
+    fn parse_embedded_flip_entry() {
+        let html = r#"
+        <div class="flip-entry" id="entry-1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj" tabindex="0" role="link">
+          <div class="flip-entry-info">
+            <a href="https://drive.google.com/file/d/1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj/view?usp=drive_web" target="_blank">
+              <div class="flip-entry-title">createA2.zip</div>
+            </a>
+          </div>
+        </div>
+        "#;
+        let files = parse_embedded_folder(html);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, "1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj");
+        assert_eq!(files[0].name, "createA2.zip");
+    }
+
+    #[test]
+    fn filename_from_drive_label() {
+        assert_eq!(
+            filename_from_label("createA2.zip Compressed archive Shared").as_deref(),
+            Some("createA2.zip")
+        );
+        assert_eq!(filename_from_label("builds.json").as_deref(), Some("builds.json"));
+        assert!(filename_from_label("Shared folder").is_none());
+    }
 }
