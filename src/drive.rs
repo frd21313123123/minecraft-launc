@@ -15,7 +15,10 @@ use zip::ZipArchive;
 
 use crate::download::{self, ProgressFn};
 use crate::error::LauncherError;
-use crate::paths::{builds_dir, ensure_dirs, instances_dir};
+use crate::paths::{
+    builds_dir, ensure_dirs, instance_dir as paths_instance_dir, instance_game_dir,
+    sanitize_build_id,
+};
 
 /// Папка со сборками на Google Drive.
 pub const DRIVE_FOLDER_ID: &str = "1mEl5hfZqx5IUiS_gULZBz4v116YuHYtq";
@@ -157,10 +160,11 @@ fn fetch_builds_manifest(
             } else {
                 b.filename
             };
-            let id = b
-                .id
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| stem_id(&filename));
+            let id = sanitize_build_id(
+                &b.id
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| stem_id(&filename)),
+            );
             BuildInfo {
                 id,
                 name: b.name,
@@ -174,6 +178,7 @@ fn fetch_builds_manifest(
 }
 
 /// Скачивает и распаковывает сборку в `instances/{id}/`.
+/// Каждая сборка — отдельная папка; user-data (saves/options) сохраняется при переустановке.
 /// Возвращает путь к инстансу и опциональные метаданные.
 pub fn install_build(
     build: &BuildInfo,
@@ -182,6 +187,7 @@ pub fn install_build(
 ) -> Result<(PathBuf, Option<BuildMeta>), LauncherError> {
     ensure_dirs()?;
     let client = download::http_client()?;
+    let build_id = sanitize_build_id(&build.id);
 
     let cache_zip = builds_dir().join(&build.filename);
     let label = format!("Скачивание «{}»", build.name);
@@ -206,12 +212,21 @@ pub fn install_build(
     }
 
     progress(0, 0, "Распаковка сборки…");
-    let dest = instances_dir().join(&build.id);
+    let dest = paths_instance_dir(&build_id);
+
+    // Сохраняем пользовательские данные (миры, настройки) перед переустановкой.
+    let preserved = stash_user_data(&dest)?;
+
     if dest.exists() {
         fs::remove_dir_all(&dest)?;
     }
     fs::create_dir_all(&dest)?;
     extract_zip(&cache_zip, &dest)?;
+
+    // Гарантируем изолированный game dir: instances/{id}/minecraft
+    let root = resolve_instance_root(&dest);
+    let game = ensure_isolated_game_dir(&root)?;
+    restore_user_data(&game, preserved)?;
 
     let meta = read_build_meta(&dest);
     progress(1, 1, &format!("Сборка «{}» готова", build.name));
@@ -219,7 +234,207 @@ pub fn install_build(
 }
 
 pub fn instance_dir(build_id: &str) -> PathBuf {
-    instances_dir().join(build_id)
+    paths_instance_dir(build_id)
+}
+
+/// Каталог `--gameDir` для сборки (mods / saves / config).
+/// Всегда внутри `instances/{id}/` — сборки не делят миры и моды.
+pub fn build_game_dir(build_id: &str) -> PathBuf {
+    let dir = instance_dir(build_id);
+    if !dir.is_dir() {
+        return instance_game_dir(build_id);
+    }
+    let root = resolve_instance_root(&dir);
+    resolve_game_dir_for_root(&root)
+}
+
+fn resolve_game_dir_for_root(root: &Path) -> PathBuf {
+    let mc = root.join("minecraft");
+    if mc.is_dir() {
+        return mc;
+    }
+    if root.join(".minecraft").is_dir() {
+        return root.join(".minecraft");
+    }
+    // Zip положил mods/config прямо в корень инстанса.
+    if root.join("mods").is_dir()
+        || root.join("config").is_dir()
+        || root.join("saves").is_dir()
+        || root.join("options.txt").is_file()
+    {
+        return root.to_path_buf();
+    }
+    // Ещё не распаковано / пусто — канонический путь.
+    mc
+}
+
+/// Создаёт `minecraft/` и при необходимости переносит туда mods/config из корня,
+/// чтобы у каждой сборки был свой изолированный game dir.
+fn ensure_isolated_game_dir(root: &Path) -> Result<PathBuf, LauncherError> {
+    let game = resolve_game_dir_for_root(root);
+    if game == root {
+        // Контент лежит в корне — оставляем как есть (корень = game dir).
+        fs::create_dir_all(root)?;
+        return Ok(root.to_path_buf());
+    }
+    fs::create_dir_all(&game)?;
+    // Если в корне остались типичные папки модпака — переносим в minecraft/.
+    for name in [
+        "mods",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "saves",
+        "defaultconfigs",
+        "options.txt",
+        "optionsof.txt",
+        "servers.dat",
+    ] {
+        let src = root.join(name);
+        let dst = game.join(name);
+        if src.exists() && src != dst && !dst.exists() {
+            fs::rename(&src, &dst).or_else(|_| {
+                if src.is_dir() {
+                    copy_dir_all(&src, &dst)?;
+                    let _ = fs::remove_dir_all(&src);
+                } else {
+                    if let Some(p) = dst.parent() {
+                        fs::create_dir_all(p)?;
+                    }
+                    fs::copy(&src, &dst)?;
+                    let _ = fs::remove_file(&src);
+                }
+                Ok::<(), LauncherError>(())
+            })?;
+        }
+    }
+    Ok(game)
+}
+
+/// Что сохраняем при переустановке сборки (не трогаем моды/конфиги пака).
+const USER_DATA_ENTRIES: &[&str] = &[
+    "saves",
+    "screenshots",
+    "logs",
+    "crash-reports",
+    "options.txt",
+    "optionsof.txt",
+    "optionsshaders.txt",
+    "servers.dat",
+    "servers.dat_old",
+    "usercache.json",
+    "usernamecache.json",
+    "command_history.txt",
+    "hotbar.nbt",
+    "realms_persistence.json",
+];
+
+struct StashedUserData {
+    tmp: PathBuf,
+}
+
+fn stash_user_data(instance: &Path) -> Result<Option<StashedUserData>, LauncherError> {
+    if !instance.is_dir() {
+        return Ok(None);
+    }
+    let root = resolve_instance_root(instance);
+    let game = resolve_game_dir_for_root(&root);
+    if !game.is_dir() {
+        return Ok(None);
+    }
+
+    let tmp = instance
+        .parent()
+        .unwrap_or(instance)
+        .join(format!(".userdata-{}", sanitize_build_id(
+            instance
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("build"),
+        )));
+    if tmp.exists() {
+        let _ = fs::remove_dir_all(&tmp);
+    }
+    fs::create_dir_all(&tmp)?;
+
+    let mut any = false;
+    for name in USER_DATA_ENTRIES {
+        let src = game.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = tmp.join(name);
+        if src.is_dir() {
+            copy_dir_all(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst)?;
+        }
+        any = true;
+    }
+
+    if any {
+        Ok(Some(StashedUserData { tmp }))
+    } else {
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(None)
+    }
+}
+
+fn restore_user_data(game: &Path, stashed: Option<StashedUserData>) -> Result<(), LauncherError> {
+    let Some(stash) = stashed else {
+        return Ok(());
+    };
+    fs::create_dir_all(game)?;
+    if let Ok(entries) = fs::read_dir(&stash.tmp) {
+        for e in entries.flatten() {
+            let src = e.path();
+            let dst = game.join(e.file_name());
+            // Не затираем файлы из новой сборки, если уже есть (кроме saves — миры важнее).
+            let name = e.file_name().to_string_lossy().to_string();
+            let prefer_user = name == "saves"
+                || name == "screenshots"
+                || name.starts_with("options")
+                || name.starts_with("servers");
+            if dst.exists() && !prefer_user {
+                continue;
+            }
+            if dst.exists() && prefer_user {
+                let _ = if dst.is_dir() {
+                    fs::remove_dir_all(&dst)
+                } else {
+                    fs::remove_file(&dst)
+                };
+            }
+            if src.is_dir() {
+                copy_dir_all(&src, &dst)?;
+            } else {
+                if let Some(p) = dst.parent() {
+                    fs::create_dir_all(p)?;
+                }
+                fs::copy(&src, &dst)?;
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&stash.tmp);
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), LauncherError> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            if let Some(p) = to.parent() {
+                fs::create_dir_all(p)?;
+            }
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn is_build_installed(build_id: &str) -> bool {
@@ -694,11 +909,7 @@ fn slug(s: &str) -> String {
         }
     }
     let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "build".into()
-    } else {
-        out
-    }
+    sanitize_build_id(&out)
 }
 
 fn pretty_name(id: &str) -> String {
