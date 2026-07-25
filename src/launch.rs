@@ -71,10 +71,20 @@ pub fn build_launch_command_with_dir(
     let natives = natives_dir(version_id);
     let assets = assets_dir();
     let client_jar = client_jar_path(&version);
+    let mod_bootstrap = uses_mod_bootstrap(&version);
 
-    if !client_jar.exists() {
+    // Vanilla: нужен client jar. NeoForge/Forge берут transformed client из libraries.
+    if !mod_bootstrap && !client_jar.exists() {
         return Err(LauncherError::Other(format!(
             "Клиент не найден: {} (установите базовую версию Minecraft)",
+            client_jar.display()
+        )));
+    }
+    // Для loader всё равно должна быть установлена parent-vanilla (assets / jar id).
+    if mod_bootstrap && !client_jar.exists() {
+        let parent = version.jar.as_deref().unwrap_or("?");
+        return Err(LauncherError::Other(format!(
+            "Не найдена базовая версия Minecraft ({parent}): {}\nУстановите vanilla перед запуском сборки.",
             client_jar.display()
         )));
     }
@@ -96,7 +106,7 @@ pub fn build_launch_command_with_dir(
         std::fs::create_dir_all(&natives)?;
     }
 
-    let classpath = build_classpath(&version, &client_jar)?;
+    let classpath = build_classpath(&version, &client_jar, mod_bootstrap)?;
     let uuid = offline_uuid(&username);
     let asset_index = version
         .asset_index
@@ -229,7 +239,17 @@ fn push_default_jvm(cmd: &mut Vec<String>, vars: &HashMap<String, String>) {
     cmd.push(vars["classpath"].clone());
 }
 
-fn build_classpath(version: &VersionJson, client_jar: &Path) -> Result<String, LauncherError> {
+/// NeoForge/Forge (ModLauncher) — mainClass = BootstrapLauncher.
+fn uses_mod_bootstrap(version: &VersionJson) -> bool {
+    let mc = version.main_class.to_lowercase();
+    mc.contains("bootstraplauncher") || mc.contains("cpw.mods.modlauncher")
+}
+
+fn build_classpath(
+    version: &VersionJson,
+    client_jar: &Path,
+    mod_bootstrap: bool,
+) -> Result<String, LauncherError> {
     use std::collections::HashSet;
 
     let sep = if cfg!(windows) { ";" } else { ":" };
@@ -249,7 +269,15 @@ fn build_classpath(version: &VersionJson, client_jar: &Path) -> Result<String, L
             push_unique(path_str(&p));
         }
     }
-    push_unique(path_str(client_jar));
+
+    // НЕ кладём vanilla client jar в classpath для NeoForge/Forge.
+    // Иначе появляется второй модуль `_1._21._1` рядом с `minecraft` и краш:
+    // "Modules _1._21._1 and minecraft export package net.minecraft.server ..."
+    // Transformed client уже в libraries (net/minecraft/client/...-srg.jar).
+    if !mod_bootstrap {
+        push_unique(path_str(client_jar));
+    }
+
     Ok(parts.join(sep))
 }
 
