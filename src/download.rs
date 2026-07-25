@@ -81,7 +81,8 @@ pub fn download_file(
         hasher.update(&buf[..n]);
         done += n as u64;
         if let Some(cb) = progress {
-            cb(done, total.max(done), label);
+            // total == 0 → размер неизвестен (не подставлять done, иначе UI всегда 100%).
+            cb(done, total, label);
         }
     }
     file.flush()?;

@@ -184,21 +184,28 @@ pub fn install_build(
     let client = download::http_client()?;
 
     let cache_zip = builds_dir().join(&build.filename);
-    progress(0, 1, &format!("Скачивание «{}»…", build.name));
+    let label = format!("Скачивание «{}»", build.name);
+    // 0/total с known size — чтобы UI сразу показал 0% и размер.
+    if let Some(sz) = build.size.filter(|&s| s > 0) {
+        progress(0, sz, &label);
+    } else {
+        progress(0, 0, &label);
+    }
 
     download_drive_file(
         &client,
         &build.file_id,
         &cache_zip,
         Some(&progress),
-        &build.name,
+        &label,
+        build.size,
     )?;
 
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(LauncherError::Other("Отменено".into()));
     }
 
-    progress(0, 1, "Распаковка сборки…");
+    progress(0, 0, "Распаковка сборки…");
     let dest = instances_dir().join(&build.id);
     if dest.exists() {
         fs::remove_dir_all(&dest)?;
@@ -220,10 +227,13 @@ pub fn is_build_installed(build_id: &str) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    // Есть хоть что-то, кроме пустой папки.
-    fs::read_dir(&dir)
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false)
+    let root = resolve_instance_root(&dir);
+    // Считаем установленной только если есть признаки реальной сборки.
+    root.join("mmc-pack.json").is_file()
+        || root.join("mods").is_dir()
+        || root.join("minecraft").join("mods").is_dir()
+        || root.join("build.json").is_file()
+        || root.join("pack.json").is_file()
 }
 
 pub fn read_build_meta(instance: &Path) -> Option<BuildMeta> {
@@ -445,10 +455,10 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
     let encoded = &body[..end];
     let decoded = decode_js_hex_escapes(encoded);
 
-    // ["FILE_ID",["FOLDER_ID"],"name.ext","mime/type"
-    // id может быть 25–44 символа (Drive file ids).
+    // ["FILE_ID",["FOLDER_ID"],"name.ext","mime/type",...,null,null,SIZE
+    // id 25–44 символа; SIZE часто идёт после двух null (метаданные Drive).
     let Ok(re) = regex_lite::Regex::new(
-        r#"\["([a-zA-Z0-9_-]{25,44})",\["([a-zA-Z0-9_-]{25,44})"\],"([^"]+\.(?:zip|json|jar|txt|mrpack))","([^"]*)""#,
+        r#"\["([a-zA-Z0-9_-]{25,44})",\["([a-zA-Z0-9_-]{25,44})"\],"([^"]+\.(?:zip|json|jar|txt|mrpack))","([^"]*)"(?:[^\]]{0,120}?null,null,(\d{3,}))?"#,
     ) else {
         return files;
     };
@@ -461,6 +471,10 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
             .get(4)
             .map(|m| m.as_str().replace("\\/", "/"))
             .unwrap_or_default();
+        let size = cap
+            .get(5)
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .filter(|&s| s > 0);
         if id.is_empty() || id == DRIVE_FOLDER_ID || name.is_empty() {
             continue;
         }
@@ -470,7 +484,7 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
             id,
             name: decode_js_string(&name),
             mime,
-            size: None,
+            size,
         });
     }
 
@@ -698,8 +712,14 @@ pub fn download_drive_file(
     dest: &Path,
     progress: Option<&ProgressFn>,
     label: &str,
+    known_size: Option<u64>,
 ) -> Result<(), LauncherError> {
     if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        if let Some(cb) = progress {
+            let len = dest.metadata().map(|m| m.len()).unwrap_or(0);
+            let total = known_size.unwrap_or(len).max(len);
+            cb(total, total, label);
+        }
         return Ok(());
     }
     if let Some(parent) = dest.parent() {
@@ -727,6 +747,8 @@ pub fn download_drive_file(
             .text()
             .map_err(|e| LauncherError::Network(e.to_string()))?;
         if let Some(confirm) = extract_confirm_token(&html) {
+            // Иногда размер лежит в HTML confirm-страницы.
+            let size_from_html = extract_size_from_confirm_html(&html);
             let url2 = format!(
                 "https://drive.google.com/uc?export=download&confirm={confirm}&id={file_id}"
             );
@@ -736,7 +758,13 @@ pub fn download_drive_file(
                 .map_err(|e| LauncherError::Network(e.to_string()))?
                 .error_for_status()
                 .map_err(|e| LauncherError::Network(e.to_string()))?;
-            return stream_to_file(resp2, dest, progress, label);
+            return stream_to_file(
+                resp2,
+                dest,
+                progress,
+                label,
+                known_size.or(size_from_html),
+            );
         }
         if html.contains("accounts.google.com") || html.contains("Sign in") {
             return Err(LauncherError::Other(
@@ -749,7 +777,7 @@ pub fn download_drive_file(
         ));
     }
 
-    stream_to_file(resp, dest, progress, label)
+    stream_to_file(resp, dest, progress, label, known_size)
 }
 
 fn download_drive_bytes(
@@ -762,7 +790,7 @@ fn download_drive_bytes(
     let tmp_dir = builds_dir().join(".tmp");
     fs::create_dir_all(&tmp_dir)?;
     let tmp = tmp_dir.join(format!("{file_id}.bin"));
-    download_drive_file(client, file_id, &tmp, progress, label)?;
+    download_drive_file(client, file_id, &tmp, progress, label, None)?;
     let bytes = fs::read(&tmp)?;
     let _ = fs::remove_file(&tmp);
     Ok(bytes)
@@ -773,12 +801,32 @@ fn stream_to_file(
     dest: &Path,
     progress: Option<&ProgressFn>,
     label: &str,
+    known_size: Option<u64>,
 ) -> Result<(), LauncherError> {
-    let total = resp.content_length().unwrap_or(0);
+    let header_total = resp.content_length().unwrap_or(0);
+    let range_total = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_total)
+        .unwrap_or(0);
+    // total == 0 → размер неизвестен (не подставляем done, иначе UI всегда 100%).
+    let total = [header_total, range_total, known_size.unwrap_or(0)]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+
     let tmp = dest.with_extension("part");
     let mut file = File::create(&tmp)?;
     let mut chunk = [0u8; 64 * 1024];
     let mut done = 0u64;
+    let mut last_report = 0u64;
+    const REPORT_EVERY: u64 = 256 * 1024; // ~0.25 МБ
+
+    if let Some(cb) = progress {
+        cb(0, total, label);
+    }
+
     loop {
         let n = resp
             .read(&mut chunk)
@@ -789,13 +837,74 @@ fn stream_to_file(
         file.write_all(&chunk[..n])?;
         done += n as u64;
         if let Some(cb) = progress {
-            cb(done, total.max(done), label);
+            if done - last_report >= REPORT_EVERY || (total > 0 && done >= total) {
+                last_report = done;
+                cb(done, total, label);
+            }
         }
+    }
+    // финальный отчёт
+    if let Some(cb) = progress {
+        let end_total = if total > 0 { total } else { done };
+        cb(done, end_total, label);
     }
     file.flush()?;
     drop(file);
     fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+/// `Content-Range: bytes 0-1023/2048` или `bytes */2048`
+fn parse_content_range_total(v: &str) -> Option<u64> {
+    let slash = v.rfind('/')?;
+    let total = v[slash + 1..].trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
+}
+
+fn extract_size_from_confirm_html(html: &str) -> Option<u64> {
+    // Иногда: " (123.4M) " / size: '123456'
+    if let Ok(re) = regex_lite::Regex::new(r#"uc-name-size[^>]*>\s*\(([^)]+)\)"#) {
+        if let Some(cap) = re.captures(html) {
+            if let Some(s) = cap.get(1).map(|m| m.as_str().trim()) {
+                if let Some(n) = parse_human_size(s) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    if let Ok(re) = regex_lite::Regex::new(r#"(?i)(?:content-length|size)["'\s:=]+(\d{4,})"#) {
+        if let Some(cap) = re.captures(html) {
+            if let Ok(n) = cap[1].parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn parse_human_size(s: &str) -> Option<u64> {
+    let s = s.trim().replace(',', ".");
+    let lower = s.to_lowercase();
+    let (num, mult) = if let Some(rest) = lower.strip_suffix('g') {
+        (rest.trim(), 1024u64 * 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix('m') {
+        (rest.trim(), 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix('k') {
+        (rest.trim(), 1024)
+    } else if let Some(rest) = lower.strip_suffix("gb") {
+        (rest.trim(), 1024u64 * 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix("mb") {
+        (rest.trim(), 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix("kb") {
+        (rest.trim(), 1024)
+    } else {
+        return s.parse().ok();
+    };
+    let f: f64 = num.parse().ok()?;
+    Some((f * mult as f64) as u64)
 }
 
 fn extract_confirm_token(html: &str) -> Option<String> {
@@ -852,13 +961,14 @@ mod tests {
     #[test]
     fn parse_drive_ivd_modern_payload() {
         let html = r#"
-        <script>window['_DRIVE_ivd'] = '\x5b\x5b\x5b\x221AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj\x22,\x5b\x221mEl5hfZqx5IUiS_gULZBz4v116YuHYtq\x22\x5d,\x22createA2.zip\x22,\x22application\/x-zip-compressed\x22,0,null';</script>
+        <script>window['_DRIVE_ivd'] = '\x5b\x5b\x5b\x221AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj\x22,\x5b\x221mEl5hfZqx5IUiS_gULZBz4v116YuHYtq\x22\x5d,\x22createA2.zip\x22,\x22application\/x-zip-compressed\x22,0,null,0,0,0,1784988932123,1784987343000,null,null,459433190,';</script>
         "#;
         let files = parse_drive_html(html);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, "1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj");
         assert_eq!(files[0].name, "createA2.zip");
         assert!(files[0].mime.contains("zip"));
+        assert_eq!(files[0].size, Some(459433190));
     }
 
     #[test]

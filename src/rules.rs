@@ -92,7 +92,51 @@ fn rule_matches(rule: &Rule) -> bool {
 }
 
 pub fn library_applies(lib: &Library) -> bool {
-    rules_allow(lib.rules.as_deref())
+    if !rules_allow(lib.rules.as_deref()) {
+        return false;
+    }
+    // Современный формат 1.19+: `group:artifact:ver:natives-windows` — отдельная запись.
+    // В JSON у windows-arm64/x86 часто только `os.name=windows`, без arch → без фильтра
+    // на classpath попадают чужие natives и игра падает.
+    if let Some(classifier) = name_native_classifier(&lib.name) {
+        return native_classifier_matches_host(classifier);
+    }
+    true
+}
+
+/// Classifier из Maven-имени (`a:b:c:natives-windows` → `natives-windows`).
+pub fn name_native_classifier(name: &str) -> Option<&str> {
+    let mut parts = name.split(':');
+    let _g = parts.next()?;
+    let _a = parts.next()?;
+    let _v = parts.next()?;
+    let classifier = parts.next()?;
+    if classifier.starts_with("natives-") {
+        Some(classifier)
+    } else {
+        None
+    }
+}
+
+/// Подходит ли classifier natives текущей ОС/архитектуре.
+pub fn native_classifier_matches_host(classifier: &str) -> bool {
+    match classifier {
+        "natives-windows" => OS_NAME == "windows" && ARCH == "x86_64",
+        "natives-windows-x86" => OS_NAME == "windows" && ARCH == "x86",
+        "natives-windows-arm64" => OS_NAME == "windows" && ARCH == "arm64",
+        "natives-linux" => OS_NAME == "linux" && ARCH == "x86_64",
+        "natives-linux-x86" | "natives-linux-i386" => OS_NAME == "linux" && ARCH == "x86",
+        "natives-linux-arm64" | "natives-linux-aarch64" => OS_NAME == "linux" && ARCH == "arm64",
+        "natives-linux-arm32" | "natives-linux-arm" => OS_NAME == "linux" && ARCH == "arm64", // rare
+        "natives-macos" | "natives-osx" => OS_NAME == "osx" && ARCH == "x86_64",
+        "natives-macos-arm64" | "natives-osx-arm64" => OS_NAME == "osx" && ARCH == "arm64",
+        // macOS patch builds / generic — только osx
+        other if other.starts_with("natives-macos") || other.starts_with("natives-osx") => {
+            OS_NAME == "osx"
+        }
+        other if other.starts_with("natives-") => false,
+        _ => true,
+    }
 }
 
 pub fn expand_argument(arg: &Argument) -> Vec<String> {
@@ -111,9 +155,18 @@ pub fn expand_argument(arg: &Argument) -> Vec<String> {
 }
 
 pub fn native_classifier(lib: &Library) -> Option<String> {
-    let natives = lib.natives.as_ref()?;
-    let key = natives.get(OS_NAME)?;
-    // ${arch} substitution
-    let arch_short = if ARCH == "x86_64" { "64" } else { "32" };
-    Some(key.replace("${arch}", arch_short))
+    // Старый формат: поле natives: { "windows": "natives-windows" }
+    if let Some(natives) = lib.natives.as_ref() {
+        if let Some(key) = natives.get(OS_NAME) {
+            let arch_short = if ARCH == "x86_64" { "64" } else { "32" };
+            return Some(key.replace("${arch}", arch_short));
+        }
+    }
+    // Новый формат: имя `…:natives-windows` — jar сам и есть natives.
+    if let Some(c) = name_native_classifier(&lib.name) {
+        if native_classifier_matches_host(c) {
+            return Some(c.to_string());
+        }
+    }
+    None
 }

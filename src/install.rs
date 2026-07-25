@@ -122,10 +122,9 @@ fn load_version_json_merged(version_id: &str, depth: u8) -> Result<VersionJson, 
 }
 
 fn merge_versions(parent: VersionJson, mut child: VersionJson) -> VersionJson {
-    // libraries: parent first, then child
-    let mut libs = parent.libraries;
-    libs.extend(child.libraries.drain(..));
-    child.libraries = libs;
+    // libraries: parent first, child overrides by exact name (иначе дубли gson и т.п.
+    // роняют BootstrapLauncher: Duplicate key …jar).
+    child.libraries = merge_libraries(parent.libraries, std::mem::take(&mut child.libraries));
 
     if child.main_class.is_empty() {
         child.main_class = parent.main_class;
@@ -179,6 +178,30 @@ fn merge_versions(parent: VersionJson, mut child: VersionJson) -> VersionJson {
     // inheritsFrom больше не нужен после merge
     child.inherits_from = None;
     child
+}
+
+/// Слияние библиотек parent+child: одинаковые `name` — побеждает child, порядок сохраняется.
+fn merge_libraries(parent: Vec<Library>, child: Vec<Library>) -> Vec<Library> {
+    use std::collections::HashMap;
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<Library> = Vec::with_capacity(parent.len() + child.len());
+    for lib in parent {
+        if let Some(&i) = index.get(&lib.name) {
+            out[i] = lib;
+        } else {
+            index.insert(lib.name.clone(), out.len());
+            out.push(lib);
+        }
+    }
+    for lib in child {
+        if let Some(&i) = index.get(&lib.name) {
+            out[i] = lib;
+        } else {
+            index.insert(lib.name.clone(), out.len());
+            out.push(lib);
+        }
+    }
+    out
 }
 
 /// Путь к client jar с учётом `jar` / inheritsFrom.
@@ -451,13 +474,29 @@ fn extract_natives_if_needed(lib: &Library, natives_out: &Path) -> Result<(), La
         return Ok(());
     };
 
-    let jar_path = if let Some(downloads) = &lib.downloads {
+    // Новый формат: сама библиотека — natives jar (artifact, не classifiers).
+    let modern_native = crate::rules::name_native_classifier(&lib.name).is_some();
+
+    let jar_path = if modern_native {
+        if let Some(downloads) = &lib.downloads {
+            if let Some(artifact) = &downloads.artifact {
+                artifact_path(lib, artifact.path.as_deref())?
+            } else {
+                maven_path_from_name(&lib.name)?
+            }
+        } else {
+            maven_path_from_name(&lib.name)?
+        }
+    } else if let Some(downloads) = &lib.downloads {
         if let Some(classifiers) = &downloads.classifiers {
             if let Some(art) = classifiers.get(&classifier) {
                 artifact_path(lib, art.path.as_deref())?
             } else {
                 return Ok(());
             }
+        } else if let Some(artifact) = &downloads.artifact {
+            // Иногда natives лежат как artifact с classifier в path
+            artifact_path(lib, artifact.path.as_deref())?
         } else {
             return Ok(());
         }
@@ -467,15 +506,27 @@ fn extract_natives_if_needed(lib: &Library, natives_out: &Path) -> Result<(), La
         if parts.len() < 3 {
             return Ok(());
         }
-        let rel = format!(
-            "{}/{}/{}/{}-{}-{}.jar",
-            parts[0].replace('.', "/"),
-            parts[1],
-            parts[2],
-            parts[1],
-            parts[2],
-            classifier
-        );
+        let rel = if parts.len() >= 4 {
+            format!(
+                "{}/{}/{}/{}-{}-{}.jar",
+                parts[0].replace('.', "/"),
+                parts[1],
+                parts[2],
+                parts[1],
+                parts[2],
+                parts[3]
+            )
+        } else {
+            format!(
+                "{}/{}/{}/{}-{}-{}.jar",
+                parts[0].replace('.', "/"),
+                parts[1],
+                parts[2],
+                parts[1],
+                parts[2],
+                classifier
+            )
+        };
         libraries_dir().join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
     };
 

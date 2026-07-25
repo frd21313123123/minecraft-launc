@@ -45,7 +45,12 @@ pub struct MineLauncherApp {
     java_label: String,
     status: String,
     detail: String,
+    /// 0.0..=1.0 при известном total; при indeterminate игнорируется.
     progress: f32,
+    /// true = размер неизвестен (бегущая полоска).
+    progress_indeterminate: bool,
+    /// Текст под полоской (МБ / %).
+    progress_text: String,
     busy: Busy,
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -80,6 +85,8 @@ impl MineLauncherApp {
             status: "Загрузка списка сборок…".into(),
             detail: String::new(),
             progress: 0.0,
+            progress_indeterminate: true,
+            progress_text: String::new(),
             busy: Busy::Idle,
             tx,
             rx,
@@ -156,6 +163,7 @@ impl MineLauncherApp {
 
         self.save_prefs();
         self.progress = 0.0;
+        self.progress_text = String::new();
         self.last_error = None;
         self.cancel.store(false, Ordering::Relaxed);
 
@@ -171,11 +179,23 @@ impl MineLauncherApp {
         } else {
             Busy::Launching
         };
-        self.status = if need_download {
-            format!("Скачивание «{}»…", build.name)
+        if need_download {
+            self.status = format!("Скачивание «{}»…", build.name);
+            if let Some(sz) = build.size.filter(|&s| s > 0) {
+                self.progress_indeterminate = false;
+                self.progress = 0.0;
+                self.progress_text = format!("0 / {} · 0%", format_bytes(sz));
+                self.detail = format!("Размер: {}", format_bytes(sz));
+            } else {
+                self.progress_indeterminate = true;
+                self.progress_text = "подключение…".into();
+                self.detail = "Идёт скачивание с Google Drive".into();
+            }
         } else {
-            format!("Запуск «{}»…", build.name)
-        };
+            self.status = format!("Запуск «{}»…", build.name);
+            self.progress_indeterminate = true;
+            self.progress_text.clear();
+        }
 
         thread::spawn(move || {
             let progress: ProgressFn = Arc::new({
@@ -366,8 +386,18 @@ impl MineLauncherApp {
                         self.detail =
                             "Залейте .zip (и при желании builds.json) в папку Google Drive".into();
                     } else {
-                        self.status = format!("Сборок: {}", self.builds.len());
-                        self.detail.clear();
+                        let installed = self
+                            .builds
+                            .iter()
+                            .filter(|b| drive::is_build_installed(&b.id))
+                            .count();
+                        self.status = format!(
+                            "Сборок на Drive: {} · установлено: {}",
+                            self.builds.len(),
+                            installed
+                        );
+                        self.detail =
+                            "Нажмите «Играть» — сборка скачается при необходимости".into();
                     }
                 }
                 WorkerMsg::BuildsErr(e) => {
@@ -380,23 +410,43 @@ impl MineLauncherApp {
                     total,
                     label,
                 } => {
-                    let t = total.max(1) as f32;
-                    self.progress = (done as f32 / t).clamp(0.0, 1.0);
-                    self.detail = label;
-                    self.status = format!("Загрузка… {done}/{total}");
+                    self.status = label;
+                    if total > 0 {
+                        self.progress_indeterminate = false;
+                        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+                        self.progress = frac;
+                        let pct = (frac * 100.0).floor() as u32;
+                        self.progress_text =
+                            format!("{} / {} · {pct}%", format_bytes(done), format_bytes(total));
+                        self.detail = self.progress_text.clone();
+                    } else {
+                        // total == 0: размер неизвестен — показываем только скачанные байты
+                        self.progress_indeterminate = true;
+                        self.progress_text = format!("скачано {}", format_bytes(done));
+                        self.detail = self.progress_text.clone();
+                    }
                 }
                 WorkerMsg::Status(s) => {
                     self.status = s;
+                    // Этап без байтового прогресса (установка MC / NeoForge / запуск)
+                    if !matches!(self.busy, Busy::Installing) || self.progress >= 1.0 {
+                        self.progress_indeterminate = true;
+                        self.progress_text.clear();
+                    }
                 }
                 WorkerMsg::DoneOk { build, username } => {
                     self.busy = Busy::Idle;
                     self.progress = 1.0;
+                    self.progress_indeterminate = false;
+                    self.progress_text.clear();
                     self.status = format!("Запущено: {username} · {build}");
                     self.detail = "Приятной игры!".into();
                 }
                 WorkerMsg::DoneErr(e) => {
                     self.busy = Busy::Idle;
                     self.progress = 0.0;
+                    self.progress_indeterminate = false;
+                    self.progress_text.clear();
                     self.status = format!("Ошибка: {e}");
                     self.detail = e.clone();
                     self.last_error = Some(e);
@@ -500,7 +550,9 @@ impl eframe::App for MineLauncherApp {
         self.poll_messages();
 
         if self.busy != Busy::Idle {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            // Чаще перерисовываем, чтобы полоска прогресса и % обновлялись плавно.
+            let ms = if self.progress_indeterminate { 33 } else { 50 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
 
         let busy = self.busy != Busy::Idle;
@@ -689,10 +741,13 @@ impl eframe::App for MineLauncherApp {
                     .circle_stroke(center, radius, Stroke::new(2.5, stroke_c));
 
                 let play_label = match self.busy {
-                    Busy::Idle => "Играть",
-                    Busy::LoadingBuilds => "…",
-                    Busy::Installing => "…",
-                    Busy::Launching => "…",
+                    Busy::Idle => "Играть".to_string(),
+                    Busy::LoadingBuilds => "…".into(),
+                    Busy::Installing if !self.progress_indeterminate && self.progress > 0.0 => {
+                        format!("{:.0}%", self.progress * 100.0)
+                    }
+                    Busy::Installing => "↓".into(),
+                    Busy::Launching => "…".into(),
                 };
                 ui.painter().text(
                     center,
@@ -709,27 +764,64 @@ impl eframe::App for MineLauncherApp {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
 
-                // Progress ring / bar under circle when busy
+                // Progress bar under circle when busy
                 if busy {
-                    let bar_w = 220.0;
+                    let bar_w = 280.0;
+                    let bar_h = 10.0;
                     let pbar = Rect::from_center_size(
-                        center + Vec2::new(0.0, radius + 28.0),
-                        Vec2::new(bar_w, 6.0),
+                        center + Vec2::new(0.0, radius + 30.0),
+                        Vec2::new(bar_w, bar_h),
                     );
                     ui.painter().rect_filled(
                         pbar,
-                        CornerRadius::same(3),
+                        CornerRadius::same(5),
                         Color32::from_rgb(40, 44, 48),
                     );
-                    let filled = Rect::from_min_size(
-                        pbar.min,
-                        Vec2::new(pbar.width() * self.progress.clamp(0.0, 1.0), pbar.height()),
-                    );
-                    ui.painter().rect_filled(
-                        filled,
-                        CornerRadius::same(3),
-                        Color32::from_rgb(50, 200, 110),
-                    );
+
+                    if self.progress_indeterminate {
+                        // Бегущий сегмент, пока размер неизвестен / этап без total.
+                        let t = ui.input(|i| i.time) as f32;
+                        let seg_w = bar_w * 0.28;
+                        let travel = bar_w + seg_w;
+                        let x = ((t * 0.9) % 1.0) * travel - seg_w;
+                        let left = (pbar.min.x + x).clamp(pbar.min.x, pbar.max.x);
+                        let right = (pbar.min.x + x + seg_w).clamp(pbar.min.x, pbar.max.x);
+                        if right > left {
+                            let seg = Rect::from_min_max(
+                                Pos2::new(left, pbar.min.y),
+                                Pos2::new(right, pbar.max.y),
+                            );
+                            ui.painter().rect_filled(
+                                seg,
+                                CornerRadius::same(5),
+                                Color32::from_rgb(50, 200, 110),
+                            );
+                        }
+                    } else {
+                        let filled = Rect::from_min_size(
+                            pbar.min,
+                            Vec2::new(
+                                pbar.width() * self.progress.clamp(0.0, 1.0),
+                                pbar.height(),
+                            ),
+                        );
+                        ui.painter().rect_filled(
+                            filled,
+                            CornerRadius::same(5),
+                            Color32::from_rgb(50, 200, 110),
+                        );
+                    }
+
+                    // Подпись: «12.4 / 438.1 МБ · 3%» или «скачано 12.4 МБ»
+                    if !self.progress_text.is_empty() {
+                        ui.painter().text(
+                            Pos2::new(main.center().x, pbar.max.y + 16.0),
+                            Align2::CENTER_CENTER,
+                            &self.progress_text,
+                            FontId::proportional(13.0),
+                            Color32::from_rgb(180, 190, 195),
+                        );
+                    }
                 }
 
                 // Settings panel overlay
@@ -865,6 +957,23 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
+    }
+}
+
+/// Человекочитаемый размер: 12.4 МБ, 438.1 МБ, 1.2 ГБ.
+fn format_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let x = n as f64;
+    if x >= GB {
+        format!("{:.2} ГБ", x / GB)
+    } else if x >= MB {
+        format!("{:.1} МБ", x / MB)
+    } else if x >= KB {
+        format!("{:.0} КБ", x / KB)
+    } else {
+        format!("{n} Б")
     }
 }
 

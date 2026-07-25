@@ -230,15 +230,26 @@ fn push_default_jvm(cmd: &mut Vec<String>, vars: &HashMap<String, String>) {
 }
 
 fn build_classpath(version: &VersionJson, client_jar: &Path) -> Result<String, LauncherError> {
+    use std::collections::HashSet;
+
     let sep = if cfg!(windows) { ";" } else { ":" };
     let mut parts: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let mut push_unique = |path: String| {
+        // BootstrapLauncher падает на дубликатах одного и того же jar.
+        let key = path.replace('/', "\\").to_lowercase();
+        if seen.insert(key) {
+            parts.push(path);
+        }
+    };
 
     for lib in &version.libraries {
         if let Some(p) = library_classpath_path(lib) {
-            parts.push(path_str(&p));
+            push_unique(path_str(&p));
         }
     }
-    parts.push(path_str(client_jar));
+    push_unique(path_str(client_jar));
     Ok(parts.join(sep))
 }
 
@@ -277,18 +288,75 @@ pub fn launch_game_with_dir(
 
     std::fs::create_dir_all(game)?;
 
+    // Лог запуска — чтобы показать ошибку, если Java сразу падает.
+    let log_path = crate::paths::app_dir().join("last_launch.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let (stdout, stderr) = match std::fs::File::create(&log_path) {
+        Ok(out) => match out.try_clone() {
+            Ok(err) => (Stdio::from(out), Stdio::from(err)),
+            Err(_) => (Stdio::from(out), Stdio::null()),
+        },
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
+
     let mut cmd = Command::new(program);
     cmd.args(rest)
         .current_dir(game)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
 
     #[cfg(windows)]
     {
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
-    cmd.spawn().map_err(|e| LauncherError::Other(format!("Не удалось запустить игру: {e}")))
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| LauncherError::Other(format!("Не удалось запустить игру: {e}")))?;
+
+    // Если процесс умер за ~2.5 с — это почти наверняка crash при старте.
+    for _ in 0..25 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let tail = read_log_tail(&log_path, 1200);
+                return Err(LauncherError::Other(format!(
+                    "Игра сразу закрылась (код {}).\n{}",
+                    status.code().unwrap_or(-1),
+                    if tail.is_empty() {
+                        format!("Смотрите лог: {}", log_path.display())
+                    } else {
+                        tail
+                    }
+                )));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(LauncherError::Other(format!("Ошибка ожидания процесса: {e}")));
+            }
+        }
+    }
+
+    Ok(child)
+}
+
+fn read_log_tail(path: &Path, max_chars: usize) -> String {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Берём хвост — там обычно Exception.
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    let start = chars.len() - max_chars;
+    format!("…{}", chars[start..].iter().collect::<String>())
 }
 
