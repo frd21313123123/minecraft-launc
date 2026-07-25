@@ -7,6 +7,10 @@ use crate::paths::{config_path, ensure_dirs};
 #[serde(default)]
 pub struct Config {
     pub username: String,
+    /// Последняя выбранная сборка (id).
+    pub last_build: String,
+    /// Старое поле — сохраняем совместимость с config.json.
+    #[serde(default)]
     pub last_version: String,
     pub ram_mb: u32,
     pub java_path: String,
@@ -17,6 +21,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             username: "Player".into(),
+            last_build: String::new(),
             last_version: String::new(),
             ram_mb: 2048,
             java_path: String::new(),

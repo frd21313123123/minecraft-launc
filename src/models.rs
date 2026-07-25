@@ -21,20 +21,34 @@ pub struct VersionEntry {
 pub struct VersionJson {
     pub id: String,
     #[serde(rename = "type")]
+    #[serde(default = "default_release")]
     pub version_type: String,
     #[serde(rename = "mainClass")]
+    #[serde(default)]
     pub main_class: String,
     #[serde(rename = "minecraftArguments")]
     pub minecraft_arguments: Option<String>,
     pub arguments: Option<Arguments>,
+    #[serde(default)]
     pub libraries: Vec<Library>,
-    pub downloads: VersionDownloads,
+    /// У vanilla всегда есть; у NeoForge/Forge часто отсутствует (inheritsFrom).
+    pub downloads: Option<VersionDownloads>,
     #[serde(rename = "assetIndex")]
-    pub asset_index: AssetIndexInfo,
+    pub asset_index: Option<AssetIndexInfo>,
     pub assets: Option<String>,
     #[serde(rename = "javaVersion")]
     pub java_version: Option<JavaVersionInfo>,
     pub logging: Option<Value>,
+    /// Родительская версия (vanilla), от которой наследуются libs/assets/jar.
+    #[serde(rename = "inheritsFrom")]
+    pub inherits_from: Option<String>,
+    /// Jar клиента, если отличается от id (редко).
+    #[serde(rename = "jar")]
+    pub jar: Option<String>,
+}
+
+fn default_release() -> String {
+    "release".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +88,8 @@ pub struct Library {
     pub natives: Option<HashMap<String, String>>,
     pub rules: Option<Vec<Rule>>,
     pub extract: Option<ExtractRules>,
+    /// Maven URL (Forge/NeoForge installer style).
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +108,7 @@ pub struct Artifact {
     pub path: Option<String>,
     pub sha1: Option<String>,
     pub size: Option<u64>,
+    #[serde(default)]
     pub url: String,
 }
 

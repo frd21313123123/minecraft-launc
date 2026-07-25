@@ -1,27 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use eframe::egui;
+use mine_launcher::paths;
+
 mod app;
-mod config;
-mod download;
-mod error;
-mod install;
-mod java;
-mod launch;
-mod models;
-mod paths;
-mod rules;
 
 use app::MineLauncherApp;
-use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     let _ = paths::ensure_dirs();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 560.0])
-            .with_min_inner_size([640.0, 500.0])
-            .with_title("MineLauncher — Minecraft"),
+            .with_inner_size([860.0, 520.0])
+            .with_min_inner_size([720.0, 440.0])
+            .with_title("MineLauncher"),
         ..Default::default()
     };
 

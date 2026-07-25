@@ -1,51 +1,59 @@
 @echo off
-chcp 65001 >nul
 setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo ========================================
-echo   MineLauncher — сборка exe
+echo   MineLauncher - build exe
 echo ========================================
 echo.
 
 where cargo >nul 2>&1
-if errorlevel 1 (
-    echo [ОШИБКА] Rust/Cargo не найден.
-    echo Установите Rust с https://rustup.rs
-    echo После установки закройте и снова откройте этот bat.
-    echo.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto :no_cargo
 
-echo [1/2] Компиляция release-сборки...
-echo       (первый раз может занять несколько минут)
+echo [1/2] cargo build --release
+echo       First build may take a few minutes.
 echo.
 cargo build --release
-if errorlevel 1 (
-    echo.
-    echo [ОШИБКА] Сборка не удалась.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto :build_fail
 
-if not exist "target\release\mine_launcher.exe" (
-    echo [ОШИБКА] Файл target\release\mine_launcher.exe не найден.
-    pause
-    exit /b 1
-)
+if not exist "target\release\mine_launcher.exe" goto :no_exe
 
 if not exist "dist" mkdir dist
 copy /Y "target\release\mine_launcher.exe" "dist\MineLauncher.exe" >nul
 copy /Y "target\release\mine_launcher.exe" "MineLauncher.exe" >nul
 
 echo.
-echo [2/2] Готово.
+echo [2/2] Done.
 echo.
-echo   exe рядом с bat:  %~dp0MineLauncher.exe
-echo   exe в папке dist: %~dp0dist\MineLauncher.exe
+echo   %~dp0MineLauncher.exe
+echo   %~dp0dist\MineLauncher.exe
 echo.
-echo Можно запускать MineLauncher.exe двойным кликом.
+echo Run MineLauncher.exe to start.
 echo.
 pause
 endlocal
+exit /b 0
+
+:no_cargo
+echo [ERROR] Rust/Cargo not found.
+echo Install Rust from https://rustup.rs
+echo Then close this window and run build.bat again.
+echo.
+pause
+endlocal
+exit /b 1
+
+:build_fail
+echo.
+echo [ERROR] cargo build failed.
+echo.
+pause
+endlocal
+exit /b 1
+
+:no_exe
+echo [ERROR] target\release\mine_launcher.exe not found.
+echo.
+pause
+endlocal
+exit /b 1

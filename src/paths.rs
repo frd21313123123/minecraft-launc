@@ -34,6 +34,16 @@ pub fn natives_dir(version_id: &str) -> PathBuf {
     versions_dir().join(version_id).join("natives")
 }
 
+/// Кэш скачанных zip-сборок с Google Drive.
+pub fn builds_dir() -> PathBuf {
+    app_dir().join("builds")
+}
+
+/// Распакованные инстансы сборок.
+pub fn instances_dir() -> PathBuf {
+    app_dir().join("instances")
+}
+
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(app_dir())?;
     std::fs::create_dir_all(game_dir())?;
@@ -42,5 +52,7 @@ pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(assets_dir())?;
     std::fs::create_dir_all(assets_dir().join("indexes"))?;
     std::fs::create_dir_all(assets_dir().join("objects"))?;
+    std::fs::create_dir_all(builds_dir())?;
+    std::fs::create_dir_all(instances_dir())?;
     Ok(())
 }

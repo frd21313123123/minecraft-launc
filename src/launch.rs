@@ -5,11 +5,11 @@ use std::process::{Child, Command, Stdio};
 use uuid::Uuid;
 
 use crate::error::LauncherError;
-use crate::install::{library_classpath_path, load_version_json};
+use crate::install::{client_jar_path, library_classpath_path, load_version_json};
 use crate::java::find_java;
 use crate::models::VersionJson;
 use crate::paths::{
-    assets_dir, ensure_dirs, game_dir, natives_dir, versions_dir, APP_NAME, LAUNCHER_VERSION,
+    assets_dir, ensure_dirs, game_dir, natives_dir, APP_NAME, LAUNCHER_VERSION,
 };
 use crate::rules::expand_argument;
 
@@ -48,7 +48,18 @@ pub fn build_launch_command(
     ram_mb: u32,
     java_path: &str,
 ) -> Result<Vec<String>, LauncherError> {
+    build_launch_command_with_dir(version_id, username, ram_mb, java_path, &game_dir())
+}
+
+pub fn build_launch_command_with_dir(
+    version_id: &str,
+    username: &str,
+    ram_mb: u32,
+    java_path: &str,
+    game: &Path,
+) -> Result<Vec<String>, LauncherError> {
     ensure_dirs()?;
+    std::fs::create_dir_all(game)?;
     let username = {
         let u = username.trim();
         let u = if u.is_empty() { "Player" } else { u };
@@ -57,30 +68,52 @@ pub fn build_launch_command(
 
     let java = find_java(java_path).ok_or(LauncherError::JavaNotFound)?;
     let version = load_version_json(version_id)?;
-    let game = game_dir();
     let natives = natives_dir(version_id);
     let assets = assets_dir();
-    let version_dir = versions_dir().join(version_id);
-    let client_jar = version_dir.join(format!("{version_id}.jar"));
+    let client_jar = client_jar_path(&version);
 
     if !client_jar.exists() {
         return Err(LauncherError::Other(format!(
-            "Клиент не найден: {}",
+            "Клиент не найден: {} (установите базовую версию Minecraft)",
             client_jar.display()
         )));
     }
 
+    // Natives: если пусто у loader-версии — взять от jar id (vanilla)
+    let natives = if natives.exists() {
+        natives
+    } else if let Some(jar_id) = version.jar.as_ref() {
+        let p = natives_dir(jar_id);
+        if p.exists() {
+            p
+        } else {
+            natives_dir(version_id)
+        }
+    } else {
+        natives
+    };
+    if !natives.exists() {
+        std::fs::create_dir_all(&natives)?;
+    }
+
     let classpath = build_classpath(&version, &client_jar)?;
     let uuid = offline_uuid(&username);
-    let asset_index = version.asset_index.id.clone();
+    let asset_index = version
+        .asset_index
+        .as_ref()
+        .map(|a| a.id.clone())
+        .unwrap_or_else(|| "legacy".into());
 
     let mut vars: HashMap<String, String> = HashMap::new();
     vars.insert("auth_player_name".into(), username.clone());
     vars.insert("version_name".into(), version_id.to_string());
-    vars.insert("game_directory".into(), path_str(&game));
+    vars.insert("game_directory".into(), path_str(game));
     vars.insert("assets_root".into(), path_str(&assets));
-    vars.insert("game_assets".into(), path_str(&assets.join("virtual").join("legacy")));
-    vars.insert("assets_index_name".into(), asset_index);
+    vars.insert(
+        "game_assets".into(),
+        path_str(&assets.join("virtual").join("legacy")),
+    );
+    vars.insert("assets_index_name".into(), asset_index.clone());
     vars.insert("auth_uuid".into(), uuid);
     vars.insert("auth_access_token".into(), "0".into());
     vars.insert("user_type".into(), "legacy".into());
@@ -88,13 +121,16 @@ pub fn build_launch_command(
     vars.insert("natives_directory".into(), path_str(&natives));
     vars.insert("launcher_name".into(), APP_NAME.into());
     vars.insert("launcher_version".into(), LAUNCHER_VERSION.into());
-    vars.insert("classpath".into(), classpath);
+    vars.insert("classpath".into(), classpath.clone());
     vars.insert("user_properties".into(), "{}".into());
     vars.insert("clientid".into(), "0".into());
     vars.insert("auth_xuid".into(), "0".into());
     vars.insert("resolution_width".into(), "854".into());
     vars.insert("resolution_height".into(), "480".into());
-    vars.insert("library_directory".into(), path_str(&crate::paths::libraries_dir()));
+    vars.insert(
+        "library_directory".into(),
+        path_str(&crate::paths::libraries_dir()),
+    );
     vars.insert(
         "classpath_separator".into(),
         if cfg!(windows) { ";".into() } else { ":".into() },
@@ -115,20 +151,36 @@ pub fn build_launch_command(
     cmd.push("-Dminecraft.api.services.host=https://0.0.0.0".into());
 
     // JVM args from version
+    let mut added_cp = false;
     if let Some(args) = &version.arguments {
         if let Some(jvm) = &args.jvm {
             for arg in jvm {
                 for piece in expand_argument(arg) {
-                    cmd.push(substitute(&piece, &vars));
+                    let s = substitute(&piece, &vars);
+                    if s == "-cp" || s == "-classpath" {
+                        added_cp = true;
+                    }
+                    cmd.push(s);
                 }
             }
         } else {
             push_default_jvm(&mut cmd, &vars);
+            added_cp = true;
         }
     } else {
         push_default_jvm(&mut cmd, &vars);
+        added_cp = true;
     }
 
+    // NeoForge/Forge часто не кладут ${classpath} в jvm-аргументы
+    if !added_cp && !cmd.iter().any(|a| a == &classpath) {
+        cmd.push("-cp".into());
+        cmd.push(classpath);
+    }
+
+    if version.main_class.is_empty() {
+        return Err(LauncherError::Other("mainClass пуст в version.json".into()));
+    }
     cmd.push(version.main_class.clone());
 
     // Game args
@@ -151,14 +203,16 @@ pub fn build_launch_command(
         cmd.push("--version".into());
         cmd.push(version_id.to_string());
         cmd.push("--gameDir".into());
-        cmd.push(path_str(&game));
+        cmd.push(path_str(game));
         cmd.push("--assetsDir".into());
         cmd.push(path_str(&assets));
         cmd.push("--assetIndex".into());
-        cmd.push(version.asset_index.id);
+        cmd.push(asset_index);
         cmd.push("--uuid".into());
         cmd.push(offline_uuid(
-            vars.get("auth_player_name").map(|s| s.as_str()).unwrap_or("Player"),
+            vars.get("auth_player_name")
+                .map(|s| s.as_str())
+                .unwrap_or("Player"),
         ));
         cmd.push("--accessToken".into());
         cmd.push("0".into());
@@ -206,14 +260,26 @@ pub fn launch_game(
     ram_mb: u32,
     java_path: &str,
 ) -> Result<Child, LauncherError> {
-    let args = build_launch_command(version_id, username, ram_mb, java_path)?;
+    launch_game_with_dir(version_id, username, ram_mb, java_path, &game_dir())
+}
+
+pub fn launch_game_with_dir(
+    version_id: &str,
+    username: &str,
+    ram_mb: u32,
+    java_path: &str,
+    game: &Path,
+) -> Result<Child, LauncherError> {
+    let args = build_launch_command_with_dir(version_id, username, ram_mb, java_path, game)?;
     let (program, rest) = args
         .split_first()
         .ok_or_else(|| LauncherError::Other("Пустая команда запуска".into()))?;
 
+    std::fs::create_dir_all(game)?;
+
     let mut cmd = Command::new(program);
     cmd.args(rest)
-        .current_dir(game_dir())
+        .current_dir(game)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
