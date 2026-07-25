@@ -26,7 +26,9 @@ pub fn is_neoforge_installed(neoforge_ver: &str) -> bool {
     json.is_file()
 }
 
-/// Скачивает installer и ставит клиент NeoForge в общий game dir лаунчера.
+/// Скачивает installer и ставит клиент NeoForge в общий runtime-каталог
+/// (`versions/` + `libraries/`). Игровые данные (mods/saves) туда не пишутся
+/// при запуске — у каждой сборки свой `--gameDir` в `instances/{id}/minecraft`.
 pub fn install_neoforge(
     neoforge_ver: &str,
     java_path: &str,

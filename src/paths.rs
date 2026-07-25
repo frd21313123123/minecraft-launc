@@ -10,6 +10,8 @@ pub fn app_dir() -> PathBuf {
         .join(APP_NAME)
 }
 
+/// Общий runtime-каталог (versions / libraries / assets).
+/// Не используется как `--gameDir`: у каждой сборки свой каталог.
 pub fn game_dir() -> PathBuf {
     app_dir().join("minecraft")
 }
@@ -39,9 +41,41 @@ pub fn builds_dir() -> PathBuf {
     app_dir().join("builds")
 }
 
-/// Распакованные инстансы сборок.
+/// Корень распакованных сборок: `instances/{build_id}/`.
+/// Каждая сборка живёт в своей папке и не пересекается с другими.
 pub fn instances_dir() -> PathBuf {
     app_dir().join("instances")
+}
+
+/// Корень конкретной сборки: `instances/{build_id}/`.
+pub fn instance_dir(build_id: &str) -> PathBuf {
+    instances_dir().join(sanitize_build_id(build_id))
+}
+
+/// Игровой каталог сборки (`--gameDir`): mods, config, saves, options.
+/// По умолчанию `instances/{build_id}/minecraft` — у каждой сборки свой.
+pub fn instance_game_dir(build_id: &str) -> PathBuf {
+    instance_dir(build_id).join("minecraft")
+}
+
+/// Безопасное имя папки сборки (без `..` и разделителей).
+pub fn sanitize_build_id(build_id: &str) -> String {
+    let s: String = build_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let s = s.trim_matches(['.', '_', '-']).to_string();
+    if s.is_empty() || s == "." || s == ".." {
+        "build".into()
+    } else {
+        s
+    }
 }
 
 pub fn ensure_dirs() -> std::io::Result<()> {

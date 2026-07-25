@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -16,7 +15,7 @@ use mine_launcher::install::{self, is_version_installed};
 use mine_launcher::java::{find_java, java_version_string};
 use mine_launcher::mmc::{self, ModLoader};
 use mine_launcher::neoforge;
-use mine_launcher::paths::{ensure_dirs, game_dir};
+use mine_launcher::paths::{ensure_dirs, instance_dir, instances_dir};
 
 #[derive(Clone)]
 enum WorkerMsg {
@@ -288,7 +287,14 @@ impl MineLauncherApp {
                 // Natives для loader-версии (на базе библиотек vanilla)
                 let _ = install::ensure_natives_for_version(&launch_id);
 
-                let game = pack.game_dir;
+                // Изолированный gameDir только этой сборки (instances/{id}/minecraft).
+                // pack.game_dir от Prism — если он внутри инстанса, используем его.
+                let inst = instance_dir(&build.id);
+                let game = if pack.game_dir.starts_with(&inst) {
+                    pack.game_dir
+                } else {
+                    drive::build_game_dir(&build.id)
+                };
                 let _ = std::fs::create_dir_all(&game);
 
                 let _ = tx.send(WorkerMsg::Status(format!("Запуск «{}»…", pack.name)));
@@ -335,7 +341,8 @@ impl MineLauncherApp {
                 }
             }
 
-            let game = instance_game_dir(&root);
+            // У каждой сборки свой gameDir — не общий MineLauncher/minecraft.
+            let game = drive::build_game_dir(&build.id);
             if let Err(e) = prepare_instance_game_dir(&root, &game) {
                 let _ = tx.send(WorkerMsg::DoneErr(e.to_string()));
                 return;
@@ -456,18 +463,6 @@ impl MineLauncherApp {
     }
 }
 
-fn instance_game_dir(root: &std::path::Path) -> PathBuf {
-    // Если в zip уже есть .minecraft-подобная структура — используем root.
-    if root.join("mods").is_dir()
-        || root.join("config").is_dir()
-        || root.join("saves").is_dir()
-        || root.join("options.txt").is_file()
-    {
-        return root.to_path_buf();
-    }
-    root.join("minecraft")
-}
-
 fn prepare_instance_game_dir(
     root: &std::path::Path,
     game: &std::path::Path,
@@ -477,20 +472,21 @@ fn prepare_instance_game_dir(
     if game == root {
         return Ok(());
     }
-    // Иначе переносим типичные папки модпака в game dir.
+    // Иначе переносим типичные папки модпака в изолированный game dir сборки.
     for name in [
         "mods",
         "config",
         "resourcepacks",
         "shaderpacks",
         "saves",
+        "defaultconfigs",
         "options.txt",
         "optionsof.txt",
         "servers.dat",
     ] {
         let src = root.join(name);
         let dst = game.join(name);
-        if src.exists() && !dst.exists() {
+        if src.exists() && src != dst && !dst.exists() {
             if src.is_dir() {
                 copy_dir_recursive(&src, &dst)?;
             } else {
@@ -929,8 +925,29 @@ impl MineLauncherApp {
                     {
                         self.reload_builds();
                     }
-                    if ui.button("Открыть папку игры").clicked() {
-                        let _ = open_path(&game_dir());
+                    if ui
+                        .button("Папка сборки")
+                        .on_hover_text(
+                            "Открыть minecraft выбранной сборки (mods, saves, config).\n\
+                             У каждой сборки своя папка — они не пересекаются.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(b) = self.selected_build() {
+                            let dir = drive::build_game_dir(&b.id);
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = open_path(&dir);
+                        } else {
+                            let _ = open_path(&instances_dir());
+                        }
+                    }
+                    if ui
+                        .button("Все сборки")
+                        .on_hover_text("Папка instances — у каждой сборки свой каталог")
+                        .clicked()
+                    {
+                        let _ = std::fs::create_dir_all(instances_dir());
+                        let _ = open_path(&instances_dir());
                     }
                 });
 
@@ -941,9 +958,11 @@ impl MineLauncherApp {
 
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new("Формат: экспорт Prism/MultiMC (mmc-pack.json + minecraft/)")
-                        .size(11.0)
-                        .color(Color32::from_rgb(100, 105, 110)),
+                    RichText::new(
+                        "Формат: Prism/MultiMC. Каждая сборка → своя папка instances/<id>/minecraft",
+                    )
+                    .size(11.0)
+                    .color(Color32::from_rgb(100, 105, 110)),
                 );
             },
         );

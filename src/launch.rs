@@ -59,6 +59,8 @@ pub fn build_launch_command_with_dir(
     game: &Path,
 ) -> Result<Vec<String>, LauncherError> {
     ensure_dirs()?;
+    // `game` — изолированный каталог сборки (mods/saves/config).
+    // versions/libraries/assets берутся из общего runtime, не из game.
     std::fs::create_dir_all(game)?;
     let username = {
         let u = username.trim();
