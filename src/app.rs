@@ -65,6 +65,8 @@ enum SettingsTab {
     About,
 }
 
+const PAGE_TRANSITION_SECONDS: f32 = 0.32;
+
 struct GalleryItem {
     path: PathBuf,
     name: String,
@@ -91,6 +93,8 @@ pub struct MineLauncherApp {
     cancel: Arc<AtomicBool>,
     page: Page,
     settings_tab: SettingsTab,
+    transition_started: Option<Instant>,
+    transition_direction: f32,
     storage_path_edit: String,
     gallery: Vec<GalleryItem>,
     gallery_status: String,
@@ -150,6 +154,8 @@ impl MineLauncherApp {
             cancel: Arc::new(AtomicBool::new(false)),
             page: Page::Home,
             settings_tab: SettingsTab::General,
+            transition_started: None,
+            transition_direction: 1.0,
             storage_path_edit,
             gallery: Vec::new(),
             gallery_status: String::new(),
@@ -170,6 +176,56 @@ impl MineLauncherApp {
         app.refresh_game_log();
         app.reload_builds();
         app
+    }
+
+    fn navigation_rank(page: Page, settings_tab: SettingsTab) -> i32 {
+        match page {
+            Page::Home => 0,
+            Page::Skins => 1,
+            Page::Gallery => 2,
+            Page::Console => 3,
+            Page::Settings => {
+                10 + match settings_tab {
+                    SettingsTab::General => 0,
+                    SettingsTab::Accounts => 1,
+                    SettingsTab::About => 2,
+                }
+            }
+        }
+    }
+
+    fn navigate_to(&mut self, ctx: &egui::Context, page: Page, settings_tab: Option<SettingsTab>) {
+        let target_tab = settings_tab.unwrap_or(self.settings_tab);
+        if self.page == page && (page != Page::Settings || self.settings_tab == target_tab) {
+            return;
+        }
+
+        let from = Self::navigation_rank(self.page, self.settings_tab);
+        let to = Self::navigation_rank(page, target_tab);
+        self.transition_direction = if to < from { -1.0 } else { 1.0 };
+        self.page = page;
+        self.settings_tab = target_tab;
+        self.transition_started = Some(Instant::now());
+        ctx.request_repaint();
+    }
+
+    fn transition_frame(&mut self, ctx: &egui::Context) -> (f32, f32, f32, bool) {
+        let Some(started) = self.transition_started else {
+            return (0.0, 1.0, 1.0, false);
+        };
+
+        let linear = (started.elapsed().as_secs_f32() / PAGE_TRANSITION_SECONDS).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - linear).powi(3);
+        let offset = self.transition_direction * 28.0 * (1.0 - eased);
+        let opacity = 0.28 + 0.72 * eased;
+
+        if linear < 1.0 {
+            ctx.request_repaint();
+        } else {
+            self.transition_started = None;
+        }
+
+        (offset, opacity, eased, linear < 1.0)
     }
 
     fn append_log(&mut self, message: impl AsRef<str>) {
@@ -793,7 +849,13 @@ impl MineLauncherApp {
         let full = ui.max_rect();
         let title_height = 36.0;
         let sidebar_width = 232.0_f32.min(full.width() * 0.27);
-        let nav_height: f32 = if self.page == Page::Console { 0.0 } else { 58.0 };
+        let nav_height_target: f32 = if self.page == Page::Console {
+            0.0
+        } else {
+            58.0
+        };
+        let nav_height =
+            ctx.animate_value_with_time(ui.id().with("top_nav_height"), nav_height_target, 0.22);
 
         ui.painter()
             .rect_filled(full, CornerRadius::ZERO, palette.background);
@@ -838,12 +900,38 @@ impl MineLauncherApp {
             Pos2::new(main.left(), top_nav.bottom()),
             main.right_bottom(),
         );
-        match self.page {
-            Page::Home => self.draw_home(ui, content, palette),
-            Page::Skins => self.draw_skins(ui, content, palette),
-            Page::Gallery => self.draw_gallery(ui, content, ctx, palette),
-            Page::Console => self.draw_console(ui, content, palette),
-            Page::Settings => self.draw_settings(ui, content, palette),
+        let (offset, opacity, transition_progress, transition_active) = self.transition_frame(ctx);
+        let animated_content = content.translate(Vec2::new(offset, 0.0));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content), |content_ui| {
+            content_ui.set_clip_rect(content);
+            content_ui.set_opacity(opacity);
+            if transition_active {
+                content_ui.disable();
+            }
+            match self.page {
+                Page::Home => self.draw_home(content_ui, animated_content, palette),
+                Page::Skins => self.draw_skins(content_ui, animated_content, palette),
+                Page::Gallery => self.draw_gallery(content_ui, animated_content, ctx, palette),
+                Page::Console => self.draw_console(content_ui, animated_content, palette),
+                Page::Settings => self.draw_settings(content_ui, animated_content, palette),
+            }
+        });
+
+        if transition_active {
+            let glow = (1.0 - transition_progress).powi(2);
+            let edge_x = if self.transition_direction > 0.0 {
+                animated_content.left()
+            } else {
+                animated_content.right()
+            };
+            let glow_color = color_with_alpha(palette.accent, 0.55 * glow);
+            ui.painter().line_segment(
+                [
+                    Pos2::new(edge_x, content.top() + 14.0),
+                    Pos2::new(edge_x, content.bottom() - 14.0),
+                ],
+                Stroke::new(2.0, glow_color),
+            );
         }
     }
 
@@ -886,8 +974,7 @@ impl MineLauncherApp {
             .interact(profile, ui.id().with("profile"), Sense::click())
             .clicked()
         {
-            self.page = Page::Settings;
-            self.settings_tab = SettingsTab::Accounts;
+            self.navigate_to(ui.ctx(), Page::Settings, Some(SettingsTab::Accounts));
         }
 
         let server_rect = Rect::from_min_size(
@@ -905,7 +992,7 @@ impl MineLauncherApp {
         )
         .clicked()
         {
-            self.page = Page::Home;
+            self.navigate_to(ui.ctx(), Page::Home, None);
         }
 
         let console_rect = server_rect.translate(Vec2::new(0.0, 64.0));
@@ -919,7 +1006,7 @@ impl MineLauncherApp {
         )
         .clicked()
         {
-            self.page = Page::Console;
+            self.navigate_to(ui.ctx(), Page::Console, None);
             self.refresh_game_log();
         }
 
@@ -937,7 +1024,7 @@ impl MineLauncherApp {
         )
         .clicked()
         {
-            self.page = Page::Settings;
+            self.navigate_to(ui.ctx(), Page::Settings, None);
             self.refresh_java_label();
         }
         ui.painter().text(
@@ -967,6 +1054,7 @@ impl MineLauncherApp {
                 palette.muted,
             );
             x += 22.0;
+            let mut active_rect = None;
             for (tab, label, width) in [
                 (SettingsTab::General, "Основное", 94.0),
                 (SettingsTab::Accounts, "Учётные записи", 142.0),
@@ -975,13 +1063,20 @@ impl MineLauncherApp {
                 let tab_rect =
                     Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(width, rect.height()));
                 if top_tab(ui, tab_rect, label, self.settings_tab == tab, palette).clicked() {
-                    self.settings_tab = tab;
+                    self.navigate_to(ui.ctx(), Page::Settings, Some(tab));
+                }
+                if self.settings_tab == tab {
+                    active_rect = Some(tab_rect);
                 }
                 x += width + 8.0;
+            }
+            if let Some(active_rect) = active_rect {
+                animated_tab_indicator(ui, "settings_tabs", active_rect, palette);
             }
             return;
         }
 
+        let mut active_rect = None;
         for (page, label, width) in [
             (Page::Home, "Установки", 94.0),
             (Page::Skins, "Скины", 72.0),
@@ -990,9 +1085,15 @@ impl MineLauncherApp {
             let tab_rect =
                 Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(width, rect.height()));
             if top_tab(ui, tab_rect, label, self.page == page, palette).clicked() {
-                self.page = page;
+                self.navigate_to(ui.ctx(), page, None);
+            }
+            if self.page == page {
+                active_rect = Some(tab_rect);
             }
             x += width + 10.0;
+        }
+        if let Some(active_rect) = active_rect {
+            animated_tab_indicator(ui, "launcher_tabs", active_rect, palette);
         }
     }
 
@@ -2463,17 +2564,36 @@ fn top_tab(
         FontId::proportional(14.0),
         color,
     );
-    if selected {
-        ui.painter().rect_filled(
-            Rect::from_min_size(
-                Pos2::new(rect.left() + 8.0, rect.bottom() - 2.0),
-                Vec2::new(rect.width() - 16.0, 2.0),
-            ),
-            CornerRadius::same(1),
-            palette.accent,
-        );
-    }
     response
+}
+
+fn animated_tab_indicator(
+    ui: &mut egui::Ui,
+    id_source: &'static str,
+    target: Rect,
+    palette: Palette,
+) {
+    let left = ui.ctx().animate_value_with_time(
+        ui.id().with((id_source, "indicator_left")),
+        target.left() + 8.0,
+        0.24,
+    );
+    let width = ui.ctx().animate_value_with_time(
+        ui.id().with((id_source, "indicator_width")),
+        target.width() - 16.0,
+        0.24,
+    );
+    let indicator = Rect::from_min_size(
+        Pos2::new(left, target.bottom() - 3.0),
+        Vec2::new(width.max(8.0), 3.0),
+    );
+    ui.painter().rect_filled(
+        indicator.expand2(Vec2::new(2.0, 1.0)),
+        CornerRadius::same(2),
+        color_with_alpha(palette.accent, 0.18),
+    );
+    ui.painter()
+        .rect_filled(indicator, CornerRadius::same(2), palette.accent);
 }
 
 fn side_button(
@@ -2484,16 +2604,32 @@ fn side_button(
     selected: bool,
     palette: Palette,
 ) -> egui::Response {
-    let response = ui.interact(rect, ui.id().with(("side", label)), Sense::click());
-    if selected {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::ZERO, palette.sidebar_selected);
+    let id = ui.id().with(("side", label));
+    let response = ui.interact(rect, id, Sense::click());
+    let selected_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("selected"), selected, 0.18);
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("hovered"), response.hovered(), 0.12);
+
+    if selected_t > 0.0 {
         ui.painter().rect_filled(
-            Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+            rect,
             CornerRadius::ZERO,
-            palette.accent,
+            color_with_alpha(palette.sidebar_selected, selected_t),
         );
-    } else if response.hovered() {
+        let bar_height = rect.height() * (0.35 + 0.65 * selected_t);
+        ui.painter().rect_filled(
+            Rect::from_center_size(
+                Pos2::new(rect.left() + 1.5, rect.center().y),
+                Vec2::new(3.0, bar_height),
+            ),
+            CornerRadius::ZERO,
+            color_with_alpha(palette.accent, selected_t),
+        );
+    }
+    if hover_t > 0.0 && selected_t < 1.0 {
         ui.painter().rect_filled(
             rect,
             CornerRadius::ZERO,
@@ -2501,7 +2637,7 @@ fn side_button(
                 palette.surface.r(),
                 palette.surface.g(),
                 palette.surface.b(),
-                130,
+                (95.0 * hover_t * (1.0 - selected_t)) as u8,
             ),
         );
     }
@@ -2525,6 +2661,15 @@ fn side_button(
         color,
     );
     response
+}
+
+fn color_with_alpha(color: Color32, opacity: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        (color.a() as f32 * opacity.clamp(0.0, 1.0)).round() as u8,
+    )
 }
 
 fn draw_eye_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
