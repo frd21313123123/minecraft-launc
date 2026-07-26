@@ -65,6 +65,13 @@ enum SettingsTab {
     About,
 }
 
+#[derive(Clone, Copy)]
+enum AccountCardAction {
+    Activate(usize),
+    Edit(usize),
+    Delete(usize),
+}
+
 const PAGE_TRANSITION_SECONDS: f32 = 0.32;
 
 struct GalleryItem {
@@ -107,6 +114,8 @@ pub struct MineLauncherApp {
     skin_model_draft: SkinModel,
     account_draft: AccountConfig,
     editing_account: Option<usize>,
+    account_editor_open: bool,
+    delete_account_confirmation: Option<usize>,
     account_message: String,
 }
 
@@ -168,6 +177,8 @@ impl MineLauncherApp {
             skin_model_draft: SkinModel::Classic,
             account_draft: empty_account(),
             editing_account: None,
+            account_editor_open: false,
+            delete_account_confirmation: None,
             account_message: String::new(),
         };
 
@@ -198,6 +209,10 @@ impl MineLauncherApp {
         let target_tab = settings_tab.unwrap_or(self.settings_tab);
         if self.page == page && (page != Page::Settings || self.settings_tab == target_tab) {
             return;
+        }
+        if page != Page::Settings || target_tab != SettingsTab::Accounts {
+            self.account_editor_open = false;
+            self.delete_account_confirmation = None;
         }
 
         let from = Self::navigation_rank(self.page, self.settings_tab);
@@ -788,6 +803,7 @@ impl MineLauncherApp {
         self.account_draft = index
             .and_then(|index| self.config.accounts.get(index).cloned())
             .unwrap_or_else(empty_account);
+        self.account_editor_open = true;
         self.account_message.clear();
     }
 
@@ -814,6 +830,7 @@ impl MineLauncherApp {
         }
         self.config.username = self.username.clone();
         let _ = self.config.save();
+        self.account_editor_open = false;
     }
 
     fn delete_account(&mut self, index: usize) {
@@ -831,7 +848,10 @@ impl MineLauncherApp {
             .username
             .clone();
         self.config.username = self.username.clone();
-        self.start_account_edit(None);
+        self.editing_account = None;
+        self.account_draft = empty_account();
+        self.account_editor_open = false;
+        self.delete_account_confirmation = None;
         self.account_message = format!("Профиль {} удалён", removed.username);
         let _ = self.config.save();
     }
@@ -950,7 +970,11 @@ impl MineLauncherApp {
             profile.min + Vec2::new(16.0, 13.0),
             Vec2::new(40.0, 40.0),
         );
-        draw_avatar(ui.painter(), avatar, palette);
+        if let Some(account) = self.config.accounts.get(self.config.active_account) {
+            draw_account_avatar(ui.painter(), avatar, account, palette);
+        } else {
+            draw_avatar(ui.painter(), avatar, palette);
+        }
         ui.painter().text(
             avatar.right_top() + Vec2::new(11.0, 7.0),
             Align2::LEFT_CENTER,
@@ -968,7 +992,7 @@ impl MineLauncherApp {
         ui.painter().circle_filled(
             Pos2::new(profile.right() - 18.0, profile.center().y),
             4.0,
-            palette.danger,
+            palette.accent,
         );
         if ui
             .interact(profile, ui.id().with("profile"), Sense::click())
@@ -2110,159 +2134,235 @@ impl MineLauncherApp {
     }
 
     fn draw_accounts_settings(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
-        let content = rect.shrink2(Vec2::new(24.0, 20.0));
+        let content = rect.shrink2(Vec2::new(24.0, 18.0));
+        let mut pending_action = None;
         ui.allocate_new_ui(
             egui::UiBuilder::new()
                 .max_rect(content)
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let list_width = 680.0_f32.min(ui.available_width()).max(360.0);
+                        let left_margin = ((ui.available_width() - list_width) * 0.5).max(0.0);
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(left_margin);
+                            ui.vertical(|ui| {
+                                ui.set_width(list_width);
+                                ui.add_space(2.0);
+
+                                let accounts = self.config.accounts.clone();
+                                let can_delete = accounts.len() > 1;
+                                for (index, account) in accounts.iter().enumerate() {
+                                    if let Some(action) = account_profile_card(
+                                        ui,
+                                        account,
+                                        index,
+                                        self.config.active_account == index,
+                                        can_delete,
+                                        palette,
+                                    ) {
+                                        pending_action = Some(action);
+                                    }
+                                    ui.add_space(10.0);
+                                }
+
+                                ui.add_space(2.0);
+                                if add_account_button(ui, palette).clicked() {
+                                    self.start_account_edit(None);
+                                }
+
+                                if !self.account_message.is_empty() {
+                                    ui.add_space(12.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            RichText::new(&self.account_message)
+                                                .size(12.0)
+                                                .color(palette.accent_text),
+                                        );
+                                    });
+                                }
+                            });
+                        });
+                    });
+            },
+        );
+
+        match pending_action {
+            Some(AccountCardAction::Activate(index)) => self.activate_account(index),
+            Some(AccountCardAction::Edit(index)) => self.start_account_edit(Some(index)),
+            Some(AccountCardAction::Delete(index)) => {
+                self.delete_account_confirmation = Some(index);
+            }
+            None => {}
+        }
+
+        self.draw_account_editor(ui.ctx(), palette);
+        self.draw_delete_account_confirmation(ui.ctx(), palette);
+    }
+
+    fn draw_account_editor(&mut self, ctx: &egui::Context, palette: Palette) {
+        if !self.account_editor_open {
+            return;
+        }
+
+        let title = if self.editing_account.is_some() {
+            "Изменить учётную запись"
+        } else {
+            "Добавить учётную запись"
+        };
+        let mut editor_open = self.account_editor_open;
+        let mut save_requested = false;
+        let mut cancel_requested = false;
+
+        egui::Window::new(title)
+            .id(egui::Id::new("account_editor"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .open(&mut editor_open)
+            .show(ctx, |ui| {
+                ui.set_width(430.0);
                 ui.label(
-                    RichText::new("Учётные записи")
-                        .size(24.0)
-                        .strong()
+                    RichText::new("Офлайн-профиль")
+                        .size(12.0)
+                        .color(palette.muted),
+                );
+                ui.add_space(10.0);
+
+                ui.label(RichText::new("Ник").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.account_draft.username)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(16)
+                        .hint_text("Player"),
+                );
+                ui.label(
+                    RichText::new("Латинские буквы, цифры и _, не более 16 символов")
+                        .size(10.5)
+                        .color(palette.muted),
+                );
+
+                ui.add_space(10.0);
+                ui.label(RichText::new("Скин").strong());
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.account_draft.skin_source)
+                            .desired_width(342.0)
+                            .hint_text("Ник Minecraft, URL или PNG-файл"),
+                    );
+                    if ui.button("Файл…").clicked() {
+                        if let Some(path) = select_skin_file() {
+                            self.account_draft.skin_source =
+                                path.to_string_lossy().to_string();
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.label(RichText::new("Модель скина").strong());
+                egui::ComboBox::from_id_salt("account_skin_model")
+                    .selected_text(self.account_draft.skin_model.label())
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.account_draft.skin_model,
+                            SkinModel::Classic,
+                            SkinModel::Classic.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.account_draft.skin_model,
+                            SkinModel::Slim,
+                            SkinModel::Slim.label(),
+                        );
+                    });
+
+                if !self.account_message.is_empty() {
+                    ui.add_space(9.0);
+                    ui.label(
+                        RichText::new(&self.account_message)
+                            .size(11.5)
+                            .color(palette.danger),
+                    );
+                }
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Сохранить").clicked() {
+                        save_requested = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        cancel_requested = true;
+                    }
+                });
+            });
+
+        if save_requested {
+            self.save_account_draft();
+        } else if cancel_requested || !editor_open {
+            self.account_editor_open = false;
+            self.account_message.clear();
+        } else {
+            self.account_editor_open = true;
+        }
+    }
+
+    fn draw_delete_account_confirmation(&mut self, ctx: &egui::Context, palette: Palette) {
+        let Some(index) = self.delete_account_confirmation else {
+            return;
+        };
+        let Some(account) = self.config.accounts.get(index) else {
+            self.delete_account_confirmation = None;
+            return;
+        };
+        let username = account.username.clone();
+        let mut confirmation_open = true;
+        let mut delete_requested = false;
+        let mut cancel_requested = false;
+
+        egui::Window::new("Удалить профиль?")
+            .id(egui::Id::new("delete_account_confirmation"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(390.0)
+            .open(&mut confirmation_open)
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(
+                    RichText::new(format!("Профиль «{username}» будет удалён из лаунчера."))
                         .color(palette.text),
                 );
                 ui.label(
-                    RichText::new(
-                        "Лаунчер хранит только офлайн-ник и настройки скина — никаких паролей.",
-                    )
-                    .color(palette.muted),
+                    RichText::new("Игровые файлы и скриншоты останутся на месте.")
+                        .size(11.0)
+                        .color(palette.muted),
                 );
                 ui.add_space(16.0);
-
-                let editor_width = (content.width() - 322.0).clamp(370.0, 570.0);
-                ui.horizontal_top(|ui| {
-                    Frame::NONE
-                        .fill(palette.surface)
-                        .stroke(Stroke::new(1.0, palette.border))
-                        .corner_radius(10.0)
-                        .inner_margin(egui::Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.set_width(270.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Профили")
-                                        .strong()
-                                        .color(palette.text),
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.button("+ Добавить").clicked() {
-                                        self.start_account_edit(None);
-                                    }
-                                });
-                            });
-                            ui.separator();
-                            let accounts = self.config.accounts.clone();
-                            for (index, account) in accounts.iter().enumerate() {
-                                let active = self.config.active_account == index;
-                                let label = if active {
-                                    format!("●  {}", account.username)
-                                } else {
-                                    format!("○  {}", account.username)
-                                };
-                                if ui
-                                    .selectable_label(active, label)
-                                    .on_hover_text("Сделать активным")
-                                    .clicked()
-                                {
-                                    self.activate_account(index);
-                                    self.start_account_edit(Some(index));
-                                }
-                                ui.label(
-                                    RichText::new(if account.skin_source.trim().is_empty() {
-                                        "Скин не указан"
-                                    } else {
-                                        "Скин настроен"
-                                    })
-                                    .size(10.5)
-                                    .color(palette.muted),
-                                );
-                                ui.add_space(6.0);
-                            }
-                        });
-
-                    ui.add_space(16.0);
-                    Frame::NONE
-                        .fill(palette.surface)
-                        .stroke(Stroke::new(1.0, palette.border))
-                        .corner_radius(10.0)
-                        .inner_margin(egui::Margin::same(18))
-                        .show(ui, |ui| {
-                            ui.set_width(editor_width);
-                            ui.label(
-                                RichText::new(if self.editing_account.is_some() {
-                                    "Редактирование профиля"
-                                } else {
-                                    "Новый профиль"
-                                })
-                                .size(18.0)
-                                .strong(),
-                            );
-                            ui.add_space(12.0);
-                            ui.label("Ник");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.account_draft.username)
-                                    .desired_width(editor_width - 36.0)
-                                    .char_limit(16)
-                                    .hint_text("Player"),
-                            );
-                            ui.add_space(8.0);
-                            ui.label("Скин: ник Minecraft или URL");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.account_draft.skin_source)
-                                    .desired_width(editor_width - 36.0)
-                                    .hint_text("Notch или https://…/skin.png"),
-                            );
-                            ui.add_space(8.0);
-                            egui::ComboBox::from_id_salt("account_skin_model")
-                                .selected_text(self.account_draft.skin_model.label())
-                                .width(230.0)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.account_draft.skin_model,
-                                        SkinModel::Classic,
-                                        SkinModel::Classic.label(),
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.account_draft.skin_model,
-                                        SkinModel::Slim,
-                                        SkinModel::Slim.label(),
-                                    );
-                                });
-                            ui.add_space(16.0);
-                            ui.horizontal(|ui| {
-                                if ui.button("Сохранить").clicked() {
-                                    self.save_account_draft();
-                                }
-                                if let Some(index) = self.editing_account {
-                                    if self.config.active_account != index
-                                        && ui.button("Сделать активным").clicked()
-                                    {
-                                        self.activate_account(index);
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.config.accounts.len() > 1,
-                                            egui::Button::new("Удалить"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.delete_account(index);
-                                    }
-                                }
-                            });
-                            if !self.account_message.is_empty() {
-                                ui.add_space(10.0);
-                                ui.label(
-                                    RichText::new(&self.account_message)
-                                        .size(12.0)
-                                        .color(palette.accent_text),
-                                );
-                            }
-                        });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new("Удалить").color(palette.danger),
+                        ))
+                        .clicked()
+                    {
+                        delete_requested = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        cancel_requested = true;
+                    }
                 });
-            },
-        );
+            });
+
+        if delete_requested {
+            self.delete_account(index);
+        } else if cancel_requested || !confirmation_open {
+            self.delete_account_confirmation = None;
+        }
     }
 
     fn draw_about(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
@@ -2544,6 +2644,355 @@ fn setting_row(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::U
     });
 }
 
+fn account_profile_card(
+    ui: &mut egui::Ui,
+    account: &AccountConfig,
+    index: usize,
+    active: bool,
+    can_delete: bool,
+    palette: Palette,
+) -> Option<AccountCardAction> {
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 82.0), Sense::hover());
+    let id = ui.id().with(("account_card", index));
+    let body_rect =
+        Rect::from_min_max(rect.min, Pos2::new((rect.right() - 88.0).max(rect.left()), rect.bottom()));
+    let body_response = ui
+        .interact(body_rect, id.with("activate"), Sense::click())
+        .on_hover_text(if active {
+            "Активный профиль"
+        } else {
+            "Сделать активным"
+        });
+    let edit_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - 58.0, rect.center().y),
+        Vec2::splat(32.0),
+    );
+    let delete_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - 22.0, rect.center().y),
+        Vec2::splat(32.0),
+    );
+    let edit_response = ui
+        .interact(edit_rect, id.with("edit"), Sense::click())
+        .on_hover_text("Изменить профиль");
+    let delete_response = ui
+        .interact(
+            delete_rect,
+            id.with("delete"),
+            if can_delete {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        )
+        .on_hover_text(if can_delete {
+            "Удалить профиль"
+        } else {
+            "Нельзя удалить единственный профиль"
+        });
+
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("hovered"), body_response.hovered(), 0.12);
+    let fill = if hover_t > 0.0 {
+        mix_color(palette.surface, palette.progress_track, hover_t * 0.72)
+    } else {
+        palette.surface
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(10), fill);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(10),
+        Stroke::new(if active { 2.0 } else { 1.0 }, if active {
+            palette.accent
+        } else {
+            palette.border
+        }),
+        egui::StrokeKind::Inside,
+    );
+
+    let avatar = Rect::from_min_size(
+        rect.min + Vec2::new(16.0, 15.0),
+        Vec2::splat(52.0),
+    );
+    draw_account_avatar(ui.painter(), avatar, account, palette);
+
+    let text_x = avatar.right() + 18.0;
+    ui.painter().text(
+        Pos2::new(text_x, rect.center().y - 10.0),
+        Align2::LEFT_CENTER,
+        truncate(&account.username, 25),
+        FontId::proportional(16.5),
+        palette.text,
+    );
+    let status_color = if active {
+        palette.accent_text
+    } else {
+        palette.muted
+    };
+    ui.painter().circle_filled(
+        Pos2::new(text_x + 3.0, rect.center().y + 15.0),
+        3.0,
+        if active {
+            palette.accent
+        } else {
+            palette.muted
+        },
+    );
+    ui.painter().text(
+        Pos2::new(text_x + 12.0, rect.center().y + 15.0),
+        Align2::LEFT_CENTER,
+        if active {
+            "Активный аккаунт"
+        } else if account.skin_source.trim().is_empty() {
+            "Офлайн"
+        } else {
+            "Офлайн · скин настроен"
+        },
+        FontId::proportional(11.5),
+        status_color,
+    );
+
+    if edit_response.hovered() {
+        ui.painter()
+            .rect_filled(edit_rect, CornerRadius::same(6), palette.progress_track);
+    }
+    if delete_response.hovered() && can_delete {
+        ui.painter()
+            .rect_filled(delete_rect, CornerRadius::same(6), palette.progress_track);
+    }
+    draw_pencil_icon(
+        ui.painter(),
+        edit_rect.center(),
+        if edit_response.hovered() {
+            palette.text
+        } else {
+            palette.muted
+        },
+    );
+    draw_trash_icon(
+        ui.painter(),
+        delete_rect.center(),
+        if !can_delete {
+            palette.disabled
+        } else if delete_response.hovered() {
+            palette.danger
+        } else {
+            palette.muted
+        },
+    );
+
+    if edit_response.clicked() {
+        Some(AccountCardAction::Edit(index))
+    } else if can_delete && delete_response.clicked() {
+        Some(AccountCardAction::Delete(index))
+    } else if !active && body_response.clicked() {
+        Some(AccountCardAction::Activate(index))
+    } else {
+        None
+    }
+}
+
+fn add_account_button(ui: &mut egui::Ui, palette: Palette) -> egui::Response {
+    let (row_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::hover());
+    let button_rect = Rect::from_center_size(
+        row_rect.center(),
+        Vec2::new(264.0_f32.min(row_rect.width()), 38.0),
+    );
+    let response = ui
+        .interact(
+            button_rect,
+            ui.id().with("add_account"),
+            Sense::click(),
+        )
+        .on_hover_text("Создать ещё один офлайн-профиль");
+
+    if response.hovered() {
+        ui.painter().rect_filled(
+            button_rect,
+            CornerRadius::same(8),
+            color_with_alpha(palette.accent, 0.08),
+        );
+    }
+    draw_dashed_rect(
+        ui.painter(),
+        button_rect,
+        if response.hovered() {
+            palette.accent_dim
+        } else {
+            palette.border
+        },
+    );
+    ui.painter().text(
+        button_rect.center(),
+        Align2::CENTER_CENTER,
+        "+ Добавить учётную запись",
+        FontId::proportional(13.0),
+        if response.hovered() {
+            palette.accent_text
+        } else {
+            palette.text
+        },
+    );
+    response
+}
+
+fn draw_pencil_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
+    painter.line_segment(
+        [
+            center + Vec2::new(-5.0, 5.0),
+            center + Vec2::new(4.5, -4.5),
+        ],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-3.0, 7.0),
+            center + Vec2::new(6.5, -2.5),
+        ],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(4.5, -4.5),
+            center + Vec2::new(6.5, -2.5),
+        ],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-5.0, 5.0),
+            center + Vec2::new(-5.8, 7.8),
+        ],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-5.8, 7.8),
+            center + Vec2::new(-3.0, 7.0),
+        ],
+        Stroke::new(1.5, color),
+    );
+}
+
+fn draw_trash_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let body = Rect::from_center_size(center + Vec2::new(0.0, 2.0), Vec2::new(9.0, 11.0));
+    painter.rect_stroke(
+        body,
+        CornerRadius::same(1),
+        Stroke::new(1.25, color),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-6.0, -5.0),
+            center + Vec2::new(6.0, -5.0),
+        ],
+        Stroke::new(1.25, color),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-2.5, -7.0),
+            center + Vec2::new(2.5, -7.0),
+        ],
+        Stroke::new(1.25, color),
+    );
+    for x in [-2.0, 2.0] {
+        painter.line_segment(
+            [
+                center + Vec2::new(x, 0.0),
+                center + Vec2::new(x, 5.0),
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
+}
+
+fn draw_account_avatar(
+    painter: &egui::Painter,
+    rect: Rect,
+    account: &AccountConfig,
+    palette: Palette,
+) {
+    let mut hash = 2_166_136_261_u32;
+    for byte in account.username.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    let backgrounds = [
+        Color32::from_rgb(55, 91, 78),
+        Color32::from_rgb(74, 73, 112),
+        Color32::from_rgb(112, 74, 63),
+        Color32::from_rgb(58, 89, 117),
+    ];
+    let hair_colors = [
+        Color32::from_rgb(54, 30, 22),
+        Color32::from_rgb(92, 56, 26),
+        Color32::from_rgb(36, 30, 32),
+        Color32::from_rgb(151, 91, 39),
+    ];
+    let skin_colors = [
+        Color32::from_rgb(242, 190, 148),
+        Color32::from_rgb(213, 153, 111),
+        Color32::from_rgb(166, 110, 76),
+        Color32::from_rgb(238, 177, 131),
+    ];
+    let variant = hash as usize % backgrounds.len();
+    painter.rect_filled(rect, CornerRadius::same(4), backgrounds[variant]);
+
+    let face = rect.shrink2(Vec2::new(9.0, 7.0));
+    let skin = skin_colors[(hash.rotate_left(7) as usize) % skin_colors.len()];
+    let hair = hair_colors[(hash.rotate_left(13) as usize) % hair_colors.len()];
+    painter.rect_filled(face, CornerRadius::ZERO, skin);
+    painter.rect_filled(
+        Rect::from_min_max(face.min, Pos2::new(face.right(), face.top() + 9.0)),
+        CornerRadius::ZERO,
+        hair,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            face.left_top() + Vec2::new(0.0, 7.0),
+            face.left_bottom() + Vec2::new(5.0, -7.0),
+        ),
+        CornerRadius::ZERO,
+        hair,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            face.right_top() + Vec2::new(-5.0, 7.0),
+            face.right_bottom() + Vec2::new(0.0, -7.0),
+        ),
+        CornerRadius::ZERO,
+        hair,
+    );
+    let eye_color = if hash & 1 == 0 {
+        Color32::from_rgb(51, 87, 67)
+    } else {
+        Color32::from_rgb(55, 72, 105)
+    };
+    let eye_y = face.top() + 19.0;
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(face.left() + 7.0, eye_y), Vec2::new(4.0, 4.0)),
+        CornerRadius::ZERO,
+        eye_color,
+    );
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(face.right() - 11.0, eye_y), Vec2::new(4.0, 4.0)),
+        CornerRadius::ZERO,
+        eye_color,
+    );
+    painter.rect_filled(
+        Rect::from_center_size(
+            Pos2::new(face.center().x, face.bottom() - 7.0),
+            Vec2::new(8.0, 3.0),
+        ),
+        CornerRadius::ZERO,
+        palette.danger,
+    );
+}
+
 fn top_tab(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -2669,6 +3118,19 @@ fn color_with_alpha(color: Color32, opacity: f32) -> Color32 {
         color.g(),
         color.b(),
         (color.a() as f32 * opacity.clamp(0.0, 1.0)).round() as u8,
+    )
+}
+
+fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel = |start: u8, end: u8| {
+        (start as f32 + (end as f32 - start as f32) * amount).round() as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        channel(from.r(), to.r()),
+        channel(from.g(), to.g()),
+        channel(from.b(), to.b()),
+        channel(from.a(), to.a()),
     )
 }
 
