@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+modId="minelauncher_skin_sync"
+version="1.0.0"
+displayName="MineLauncher Skin Sync"
+authors="MineLauncher"
+description='''
+Synchronizes the skin selected in MineLauncher with SkinsRestorer after joining a server.
+'''
+displayTest="IGNORE_ALL_VERSION"
+
+[[dependencies.minelauncher_skin_sync]]
+modId="neoforge"
+type="required"
+versionRange="[21.1,22)"
+ordering="NONE"
+side="CLIENT"
+
+[[dependencies.minelauncher_skin_sync]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1,1.21.2)"
+ordering="NONE"
+side="CLIENT"

@@ -21,6 +21,7 @@ use mine_launcher::paths::{
     builds_root, ensure_dirs, instance_dir, instances_dir, last_launch_log, screenshots_dir,
     set_builds_root,
 };
+use mine_launcher::skin_sync::{self, SkinSyncOutcome};
 
 #[derive(Clone)]
 enum WorkerMsg {
@@ -35,6 +36,7 @@ enum WorkerMsg {
     DoneOk {
         build: String,
         username: String,
+        skin_sync: Option<Result<SkinSyncOutcome, String>>,
     },
     DoneErr(String),
 }
@@ -300,6 +302,16 @@ impl MineLauncherApp {
         let tx = self.tx.clone();
         let cancel = self.cancel.clone();
         let need_download = !drive::is_build_installed(&build.id);
+        let skin_account = self
+            .config
+            .accounts
+            .get(self.config.active_account)
+            .cloned()
+            .unwrap_or_else(|| AccountConfig {
+                username: username.clone(),
+                ..Default::default()
+            });
+        let skin_server_address = self.config.server_address.clone();
 
         self.busy = if need_download {
             Busy::Installing
@@ -418,12 +430,36 @@ impl MineLauncherApp {
                 };
                 let _ = std::fs::create_dir_all(&game);
 
+                let skin_sync = match &pack.loader {
+                    ModLoader::NeoForge { .. } if pack.minecraft == "1.21.1" => {
+                        let _ = tx.send(WorkerMsg::Status(
+                            "Подготовка синхронизации скина…".into(),
+                        ));
+                        Some(skin_sync::prepare_for_launch(
+                            &skin_account,
+                            &game,
+                            &skin_server_address,
+                        ))
+                    }
+                    ModLoader::NeoForge { .. } if skin_account.skin_source.trim().is_empty() => None,
+                    ModLoader::NeoForge { .. } => Some(Err(format!(
+                        "Автосинхронизация скина пока поддерживает Minecraft 1.21.1, а в сборке {}",
+                        pack.minecraft
+                    ))),
+                    _ if skin_account.skin_source.trim().is_empty() => None,
+                    _ => Some(Err(
+                        "Для автосинхронизации скина нужна клиентская сборка NeoForge 1.21.1"
+                            .into(),
+                    )),
+                };
+
                 let _ = tx.send(WorkerMsg::Status(format!("Запуск «{}»…", pack.name)));
                 match launch_game_in_dir(&launch_id, &username, ram, &java_path, &game) {
                     Ok(_) => {
                         let _ = tx.send(WorkerMsg::DoneOk {
                             build: pack.name,
                             username,
+                            skin_sync,
                         });
                     }
                     Err(error) => {
@@ -468,11 +504,20 @@ impl MineLauncherApp {
             }
 
             let _ = tx.send(WorkerMsg::Status(format!("Запуск «{}»…", build.name)));
+            let skin_sync = if skin_account.skin_source.trim().is_empty() {
+                None
+            } else {
+                Some(Err(
+                    "Для автосинхронизации скина нужна клиентская сборка NeoForge 1.21.1"
+                        .into(),
+                ))
+            };
             match launch_game_in_dir(&minecraft, &username, ram, &java_path, &game) {
                 Ok(_) => {
                     let _ = tx.send(WorkerMsg::DoneOk {
                         build: build.name,
                         username,
+                        skin_sync,
                     });
                 }
                 Err(error) => {
@@ -544,14 +589,29 @@ impl MineLauncherApp {
                     self.progress_indeterminate = true;
                     self.append_log(status);
                 }
-                WorkerMsg::DoneOk { build, username } => {
+                WorkerMsg::DoneOk {
+                    build,
+                    username,
+                    skin_sync,
+                } => {
                     self.busy = Busy::Idle;
                     self.progress = 1.0;
                     self.progress_indeterminate = false;
                     self.progress_text.clear();
                     self.status = format!("Запущено: {build}");
-                    self.detail = format!("Игрок {username} · приятной игры!");
+                    self.detail = match &skin_sync {
+                        Some(Ok(SkinSyncOutcome::Ready)) => {
+                            format!("Игрок {username} · скин применится после входа на сервер")
+                        }
+                        Some(Err(error)) => {
+                            format!("Игра запущена, но скин не синхронизирован: {error}")
+                        }
+                        _ => format!("Игрок {username} · приятной игры!"),
+                    };
                     self.append_log(format!("Игра запущена: {build} ({username})"));
+                    if let Some(Err(error)) = skin_sync {
+                        self.append_log(format!("Синхронизация скина: {error}"));
+                    }
                     self.refresh_game_log();
                 }
                 WorkerMsg::DoneErr(error) => {
@@ -1239,10 +1299,17 @@ impl MineLauncherApp {
             Stroke::new(1.3, check_color),
         );
         if can_apply && apply_response.clicked() {
-            let command = self.active_skin_command();
-            ui.ctx().copy_text(command);
-            self.account_message =
-                "Команда SkinRestorer скопирована — вставьте её в чат сервера".into();
+            if is_local_skin_source(&account.skin_source) {
+                self.account_message =
+                    "PNG автоматически загрузится и применится при следующем входе на сервер"
+                        .into();
+            } else {
+                let command = self.active_skin_command();
+                ui.ctx().copy_text(command);
+                self.account_message =
+                    "Скин применится автоматически при входе; команда скопирована как запасной вариант"
+                        .into();
+            }
         }
 
         let tabs_y = right.top() + 1.0;
@@ -1397,8 +1464,8 @@ impl MineLauncherApp {
                     if is_local_skin_source(&self.skin_source_draft) {
                         ui.label(
                             RichText::new(
-                                "Локальный файл будет сохранён в библиотеке. Для SkinRestorer \
-                                 нужна публичная ссылка или ник.",
+                                "Локальный PNG будет автоматически загружен через официальный \
+                                 MineSkin API и применён при входе на сервер.",
                             )
                             .color(palette.muted),
                         );
@@ -1861,7 +1928,8 @@ impl MineLauncherApp {
                         });
                         ui.label(
                             RichText::new(
-                                "Скины хранятся по профилям лаунчера. Команда SkinRestorer доступна во вкладке «Скины».",
+                                "Выбранный скин автоматически применяется через SkinsRestorer при входе \
+                                 с NeoForge 1.21.1. Локальные PNG загружаются через MineSkin.",
                             )
                             .size(11.0)
                             .color(palette.muted),
@@ -2284,7 +2352,7 @@ fn is_local_skin_source(source: &str) -> bool {
 }
 
 fn can_apply_skin_source(source: &str) -> bool {
-    !source.trim().is_empty() && !is_local_skin_source(source)
+    !source.trim().is_empty()
 }
 
 fn validate_skin_file(path: &Path) -> Result<(), String> {
