@@ -1,5 +1,6 @@
 /target/
 /dist/
+/client-mod/build/
 **/*.rs.bk
 .idea/
 .vscode/

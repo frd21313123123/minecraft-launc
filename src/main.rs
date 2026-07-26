@@ -12,9 +12,9 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([860.0, 520.0])
-            .with_min_inner_size([720.0, 440.0])
-            .with_title("MineLauncher"),
+            .with_inner_size([1240.0, 760.0])
+            .with_min_inner_size([960.0, 620.0])
+            .with_title("MineLauncher Beta"),
         ..Default::default()
     };
 

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 
 pub const APP_NAME: &str = "MineLauncher";
 pub const LAUNCHER_VERSION: &str = "1.0.0";
@@ -10,6 +11,27 @@ pub fn app_dir() -> PathBuf {
         .join(APP_NAME)
 }
 
+fn builds_root_override() -> &'static RwLock<Option<PathBuf>> {
+    static ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+    ROOT.get_or_init(|| RwLock::new(None))
+}
+
+/// Меняет корень, в котором хранятся архивы и распакованные сборки.
+/// Пустой путь возвращает стандартное расположение внутри каталога приложения.
+pub fn set_builds_root(path: Option<PathBuf>) {
+    if let Ok(mut root) = builds_root_override().write() {
+        *root = path.filter(|p| !p.as_os_str().is_empty());
+    }
+}
+
+pub fn builds_root() -> PathBuf {
+    builds_root_override()
+        .read()
+        .ok()
+        .and_then(|root| root.clone())
+        .unwrap_or_else(app_dir)
+}
+
 /// Общий runtime-каталог (versions / libraries / assets).
 /// Не используется как `--gameDir`: у каждой сборки свой каталог.
 pub fn game_dir() -> PathBuf {
@@ -18,6 +40,20 @@ pub fn game_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     app_dir().join("config.json")
+}
+
+/// Пользовательская галерея лаунчера.
+///
+/// Папка располагается рядом с местом запуска приложения, чтобы владелец
+/// сборки мог просто положить туда PNG/JPG/WebP без поиска AppData.
+pub fn screenshots_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("screenshots")
+}
+
+pub fn last_launch_log() -> PathBuf {
+    app_dir().join("last_launch.log")
 }
 
 pub fn versions_dir() -> PathBuf {
@@ -38,13 +74,18 @@ pub fn natives_dir(version_id: &str) -> PathBuf {
 
 /// Кэш скачанных zip-сборок с Google Drive.
 pub fn builds_dir() -> PathBuf {
-    app_dir().join("builds")
+    let root = builds_root();
+    if root == app_dir() {
+        root.join("builds")
+    } else {
+        root.join("archives")
+    }
 }
 
 /// Корень распакованных сборок: `instances/{build_id}/`.
 /// Каждая сборка живёт в своей папке и не пересекается с другими.
 pub fn instances_dir() -> PathBuf {
-    app_dir().join("instances")
+    builds_root().join("instances")
 }
 
 /// Корень конкретной сборки: `instances/{build_id}/`.
@@ -80,6 +121,7 @@ pub fn sanitize_build_id(build_id: &str) -> String {
 
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(app_dir())?;
+    std::fs::create_dir_all(builds_root())?;
     std::fs::create_dir_all(game_dir())?;
     std::fs::create_dir_all(versions_dir())?;
     std::fs::create_dir_all(libraries_dir())?;
@@ -88,5 +130,6 @@ pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(assets_dir().join("objects"))?;
     std::fs::create_dir_all(builds_dir())?;
     std::fs::create_dir_all(instances_dir())?;
+    std::fs::create_dir_all(screenshots_dir())?;
     Ok(())
 }
