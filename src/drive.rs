@@ -198,6 +198,18 @@ pub fn install_build(
         progress(0, 0, &label);
     }
 
+    // Не доверяем кэшу только потому, что файл ненулевого размера: прерванная
+    // загрузка тоже оставляет ненулевой файл, но у него нет ZIP central directory.
+    if cache_zip.exists() && validate_zip_archive(&cache_zip).is_err() {
+        fs::remove_file(&cache_zip)?;
+        let _ = fs::remove_file(cache_zip.with_extension("part"));
+        progress(
+            0,
+            build.size.unwrap_or(0),
+            "Повреждённый кэш удалён, скачиваем заново…",
+        );
+    }
+
     download_drive_file(
         &client,
         &build.file_id,
@@ -206,6 +218,29 @@ pub fn install_build(
         &label,
         build.size,
     )?;
+
+    // Drive изредка завершает ответ раньше времени. Если размер ответа нельзя
+    // было проверить по HTTP-заголовкам, ZIP-проверка поймает это здесь.
+    if let Err(first_error) = validate_zip_archive(&cache_zip) {
+        fs::remove_file(&cache_zip)?;
+        let retry_label = format!("Повторное скачивание «{}»", build.name);
+        progress(0, build.size.unwrap_or(0), &retry_label);
+        download_drive_file(
+            &client,
+            &build.file_id,
+            &cache_zip,
+            Some(&progress),
+            &retry_label,
+            build.size,
+        )?;
+        validate_zip_archive(&cache_zip).map_err(|retry_error| {
+            let _ = fs::remove_file(&cache_zip);
+            LauncherError::Other(format!(
+                "Архив сборки повреждён даже после повторной загрузки \
+                 ({first_error}; повторно: {retry_error}). Проверьте соединение и свободное место."
+            ))
+        })?;
+    }
 
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(LauncherError::Other("Отменено".into()));
@@ -925,13 +960,24 @@ pub fn download_drive_file(
     label: &str,
     known_size: Option<u64>,
 ) -> Result<(), LauncherError> {
-    if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        if let Some(cb) = progress {
-            let len = dest.metadata().map(|m| m.len()).unwrap_or(0);
-            let total = known_size.unwrap_or(len).max(len);
-            cb(total, total, label);
+    if dest.exists() {
+        let len = dest.metadata().map(|m| m.len()).unwrap_or(0);
+        let size_matches = known_size
+            .filter(|&size| size > 0)
+            .map_or(true, |size| size == len);
+        if len > 0 && size_matches {
+            if let Some(cb) = progress {
+                let total = known_size.unwrap_or(len).max(len);
+                cb(total, total, label);
+            }
+            return Ok(());
         }
-        return Ok(());
+
+        // Нулевой или не совпадающий с ожидаемым размером файл — не кэш, а
+        // след незавершённой загрузки.
+        if dest.is_file() {
+            fs::remove_file(dest)?;
+        }
     }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -952,14 +998,34 @@ pub fn download_drive_file(
         .unwrap_or("")
         .to_string();
 
-    // Большие файлы: HTML с confirm-токеном.
+    // Большие файлы: HTML с формой подтверждения антивирусного предупреждения.
     if content_type.contains("text/html") {
         let html = resp
             .text()
             .map_err(|e| LauncherError::Network(e.to_string()))?;
+        let size_from_html = extract_size_from_confirm_html(&html);
+
+        // Новый формат Drive (2026): action ведёт на drive.usercontent.google.com,
+        // а кроме confirm=t обязателен одноразовый uuid из hidden input.
+        if let Some((action, params)) = extract_download_form(&html) {
+            let resp2 = client
+                .get(action)
+                .query(&params)
+                .send()
+                .map_err(|e| LauncherError::Network(e.to_string()))?
+                .error_for_status()
+                .map_err(|e| LauncherError::Network(e.to_string()))?;
+            return stream_drive_response(
+                resp2,
+                dest,
+                progress,
+                label,
+                known_size.or(size_from_html),
+            );
+        }
+
+        // Старый формат Drive: confirm-токен находился прямо в ссылке.
         if let Some(confirm) = extract_confirm_token(&html) {
-            // Иногда размер лежит в HTML confirm-страницы.
-            let size_from_html = extract_size_from_confirm_html(&html);
             let url2 = format!(
                 "https://drive.google.com/uc?export=download&confirm={confirm}&id={file_id}"
             );
@@ -969,7 +1035,7 @@ pub fn download_drive_file(
                 .map_err(|e| LauncherError::Network(e.to_string()))?
                 .error_for_status()
                 .map_err(|e| LauncherError::Network(e.to_string()))?;
-            return stream_to_file(
+            return stream_drive_response(
                 resp2,
                 dest,
                 progress,
@@ -988,6 +1054,36 @@ pub fn download_drive_file(
         ));
     }
 
+    stream_to_file(resp, dest, progress, label, known_size)
+}
+
+fn stream_drive_response(
+    resp: reqwest::blocking::Response,
+    dest: &Path,
+    progress: Option<&ProgressFn>,
+    label: &str,
+    known_size: Option<u64>,
+) -> Result<(), LauncherError> {
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if content_type.contains("text/html") {
+        let html = resp
+            .text()
+            .map_err(|e| LauncherError::Network(e.to_string()))?;
+        if html.contains("accounts.google.com") || html.contains("Sign in") {
+            return Err(LauncherError::Other(
+                "Нет доступа к файлу на Google Drive. Откройте доступ «всем по ссылке»."
+                    .into(),
+            ));
+        }
+        return Err(LauncherError::Other(
+            "Google Drive повторно вернул веб-страницу вместо архива.".into(),
+        ));
+    }
     stream_to_file(resp, dest, progress, label, known_size)
 }
 
@@ -1021,11 +1117,16 @@ fn stream_to_file(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range_total)
         .unwrap_or(0);
+    // HTTP-размер надёжнее размера из каталога Drive. Последний используем
+    // как fallback, когда сервер не прислал ни Content-Length, ни Content-Range.
+    let response_total = header_total.max(range_total);
+    let expected = if response_total > 0 {
+        response_total
+    } else {
+        known_size.unwrap_or(0)
+    };
     // total == 0 → размер неизвестен (не подставляем done, иначе UI всегда 100%).
-    let total = [header_total, range_total, known_size.unwrap_or(0)]
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let total = response_total.max(known_size.unwrap_or(0));
 
     let tmp = dest.with_extension("part");
     let mut file = File::create(&tmp)?;
@@ -1054,13 +1155,21 @@ fn stream_to_file(
             }
         }
     }
+    file.flush()?;
+    drop(file);
+
+    if expected > 0 && done != expected {
+        let _ = fs::remove_file(&tmp);
+        return Err(LauncherError::Network(format!(
+            "загрузка «{label}» оборвалась: получено {done} из {expected} байт"
+        )));
+    }
+
     // финальный отчёт
     if let Some(cb) = progress {
         let end_total = if total > 0 { total } else { done };
         cb(done, end_total, label);
     }
-    file.flush()?;
-    drop(file);
     fs::rename(&tmp, dest)?;
     Ok(())
 }
@@ -1118,6 +1227,80 @@ fn parse_human_size(s: &str) -> Option<u64> {
     Some((f * mult as f64) as u64)
 }
 
+fn extract_download_form(html: &str) -> Option<(reqwest::Url, Vec<(String, String)>)> {
+    let lower = html.to_ascii_lowercase();
+    let id_re =
+        regex_lite::Regex::new(r#"(?i)\bid\s*=\s*["']download-form["']"#).ok()?;
+    let id_match = id_re.find(html)?;
+    let form_start = lower[..id_match.start()].rfind("<form")?;
+    let tag_end = form_start + html[form_start..].find('>')? + 1;
+    let form_end = tag_end + lower[tag_end..].find("</form>")?;
+    let form_tag = &html[form_start..tag_end];
+    let form_body = &html[tag_end..form_end];
+
+    let action = decode_html_attribute(&html_attribute(form_tag, "action")?);
+    let action = if action.starts_with("//") {
+        format!("https:{action}")
+    } else if action.starts_with('/') {
+        format!("https://drive.google.com{action}")
+    } else {
+        action
+    };
+    let action = reqwest::Url::parse(&action).ok()?;
+    if action.scheme() != "https"
+        || !matches!(
+            action.host_str(),
+            Some("drive.google.com" | "drive.usercontent.google.com")
+        )
+    {
+        return None;
+    }
+
+    let mut params = Vec::new();
+    let body_lower = form_body.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(relative_start) = body_lower[offset..].find("<input") {
+        let input_start = offset + relative_start;
+        let Some(relative_end) = form_body[input_start..].find('>') else {
+            break;
+        };
+        let input_end = input_start + relative_end + 1;
+        let input_tag = &form_body[input_start..input_end];
+        if let Some(name) = html_attribute(input_tag, "name") {
+            let value = html_attribute(input_tag, "value").unwrap_or_default();
+            params.push((
+                decode_html_attribute(&name),
+                decode_html_attribute(&value),
+            ));
+        }
+        offset = input_end;
+    }
+
+    if !params.iter().any(|(name, _)| name == "id")
+        || !params.iter().any(|(name, _)| name == "confirm")
+    {
+        return None;
+    }
+    Some((action, params))
+}
+
+fn html_attribute(tag: &str, name: &str) -> Option<String> {
+    let pattern = format!(r#"(?i)\b{name}\s*=\s*["']([^"']*)["']"#);
+    let re = regex_lite::Regex::new(&pattern).ok()?;
+    re.captures(tag)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().to_string())
+}
+
+fn decode_html_attribute(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
 fn extract_confirm_token(html: &str) -> Option<String> {
     // confirm=XXXX
     for key in ["confirm=", "confirm&amp;"] {
@@ -1132,10 +1315,16 @@ fn extract_confirm_token(html: &str) -> Option<String> {
             }
         }
     }
-    // form with id download-form
-    let re = regex_lite::Regex::new(r#"name="confirm"\s+value="([^"]+)""#).ok()?;
-    re.captures(html)
-        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+    None
+}
+
+fn validate_zip_archive(zip_path: &Path) -> Result<(), LauncherError> {
+    let file = File::open(zip_path)?;
+    let archive = ZipArchive::new(file).map_err(|e| LauncherError::Other(format!("ZIP: {e}")))?;
+    if archive.is_empty() {
+        return Err(LauncherError::Other("ZIP: архив пуст".into()));
+    }
+    Ok(())
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), LauncherError> {
@@ -1218,5 +1407,57 @@ mod tests {
         );
         assert_eq!(filename_from_label("builds.json").as_deref(), Some("builds.json"));
         assert!(filename_from_label("Shared folder").is_none());
+    }
+
+    #[test]
+    fn parses_modern_drive_download_form_with_uuid() {
+        let html = r#"
+        <form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
+          <input type="hidden" name="id" value="1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj">
+          <input type="hidden" name="export" value="download">
+          <input type="hidden" name="confirm" value="t">
+          <input type="hidden" name="uuid" value="1d9f5368-1c76-43bc-a6fa-59d6253a5508">
+        </form>
+        "#;
+
+        let (action, params) = extract_download_form(html).unwrap();
+        assert_eq!(action.as_str(), "https://drive.usercontent.google.com/download");
+        assert!(params
+            .iter()
+            .any(|(name, value)| name == "confirm" && value == "t"));
+        assert!(params.iter().any(|(name, value)| {
+            name == "uuid" && value == "1d9f5368-1c76-43bc-a6fa-59d6253a5508"
+        }));
+    }
+
+    #[test]
+    fn validates_complete_zip_and_rejects_truncated_zip() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let valid_path =
+            std::env::temp_dir().join(format!("mine-launcher-valid-{suffix}.zip"));
+        let truncated_path =
+            std::env::temp_dir().join(format!("mine-launcher-truncated-{suffix}.zip"));
+
+        let file = File::create(&valid_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("build.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"{}").unwrap();
+        writer.finish().unwrap();
+        fs::write(&truncated_path, b"PK\x03\x04incomplete archive").unwrap();
+
+        assert!(validate_zip_archive(&valid_path).is_ok());
+        assert!(validate_zip_archive(&truncated_path).is_err());
+
+        let _ = fs::remove_file(valid_path);
+        let _ = fs::remove_file(truncated_path);
     }
 }
