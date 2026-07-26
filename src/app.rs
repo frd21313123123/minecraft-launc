@@ -14,7 +14,7 @@ use mine_launcher::config::{AccountConfig, Config, SkinModel, Theme};
 use mine_launcher::download::ProgressFn;
 use mine_launcher::drive::{self, BuildInfo};
 use mine_launcher::install::{self, is_version_installed};
-use mine_launcher::java::{find_java, java_version_string};
+use mine_launcher::java::{ensure_java_for_version, find_java, java_version_string};
 use mine_launcher::mmc::{self, ModLoader};
 use mine_launcher::neoforge;
 use mine_launcher::paths::{
@@ -355,13 +355,6 @@ impl MineLauncherApp {
             self.detail = "Добавьте .zip в папку Google Drive".into();
             return;
         };
-        if find_java(&self.config.java_path).is_none() {
-            self.status = "Java не найдена".into();
-            self.detail = "Укажите Java 17/21 в настройках".into();
-            self.refresh_java_label();
-            return;
-        }
-
         self.save_prefs();
         self.progress = 0.0;
         self.progress_text.clear();
@@ -460,6 +453,23 @@ impl MineLauncherApp {
                     }
                 }
 
+                let _ = tx.send(WorkerMsg::Status(format!(
+                    "Подготовка Java для Minecraft {}…",
+                    pack.minecraft
+                )));
+                let java = match ensure_java_for_version(
+                    &pack.minecraft,
+                    &java_path,
+                    Some(&progress),
+                    Some(cancel.as_ref()),
+                ) {
+                    Ok(java) => java.to_string_lossy().into_owned(),
+                    Err(error) => {
+                        let _ = tx.send(WorkerMsg::DoneErr(error.to_string()));
+                        return;
+                    }
+                };
+
                 let launch_id = match &pack.loader {
                     ModLoader::None => pack.minecraft.clone(),
                     ModLoader::NeoForge { version } => {
@@ -469,7 +479,7 @@ impl MineLauncherApp {
                             )));
                             match neoforge::install_neoforge(
                                 version,
-                                &java_path,
+                                &java,
                                 progress.clone(),
                                 cancel.clone(),
                             ) {
@@ -525,7 +535,7 @@ impl MineLauncherApp {
                 };
 
                 let _ = tx.send(WorkerMsg::Status(format!("Запуск «{}»…", pack.name)));
-                match launch_game_in_dir(&launch_id, &username, ram, &java_path, &game) {
+                match launch_game_in_dir(&launch_id, &username, ram, &java, &game) {
                     Ok(_) => {
                         let _ = tx.send(WorkerMsg::DoneOk {
                             build: pack.name,
@@ -562,11 +572,29 @@ impl MineLauncherApp {
                 let _ = tx.send(WorkerMsg::Status(format!(
                     "Установка Minecraft {minecraft}…"
                 )));
-                if let Err(error) = install::install_version(&minecraft, progress, cancel) {
+                if let Err(error) =
+                    install::install_version(&minecraft, progress.clone(), cancel.clone())
+                {
                     let _ = tx.send(WorkerMsg::DoneErr(error.to_string()));
                     return;
                 }
             }
+
+            let _ = tx.send(WorkerMsg::Status(format!(
+                "Подготовка Java для Minecraft {minecraft}…"
+            )));
+            let java = match ensure_java_for_version(
+                &minecraft,
+                &java_path,
+                Some(&progress),
+                Some(cancel.as_ref()),
+            ) {
+                Ok(java) => java.to_string_lossy().into_owned(),
+                Err(error) => {
+                    let _ = tx.send(WorkerMsg::DoneErr(error.to_string()));
+                    return;
+                }
+            };
 
             let game = drive::build_game_dir(&build.id);
             if let Err(error) = prepare_instance_game_dir(&root, &game) {
@@ -583,7 +611,7 @@ impl MineLauncherApp {
                         .into(),
                 ))
             };
-            match launch_game_in_dir(&minecraft, &username, ram, &java_path, &game) {
+            match launch_game_in_dir(&minecraft, &username, ram, &java, &game) {
                 Ok(_) => {
                     let _ = tx.send(WorkerMsg::DoneOk {
                         build: build.name,
@@ -665,6 +693,7 @@ impl MineLauncherApp {
                     username,
                     skin_sync,
                 } => {
+                    self.refresh_java_label();
                     self.busy = Busy::Idle;
                     self.progress = 1.0;
                     self.progress_indeterminate = false;
@@ -686,6 +715,7 @@ impl MineLauncherApp {
                     self.refresh_game_log();
                 }
                 WorkerMsg::DoneErr(error) => {
+                    self.refresh_java_label();
                     self.busy = Busy::Idle;
                     self.progress = 0.0;
                     self.progress_indeterminate = false;
@@ -2019,12 +2049,12 @@ impl MineLauncherApp {
                             );
                         });
                         ui.add_space(10.0);
-                        ui.label("Java 17 / Java 21");
+                        ui.label("Java (версия подбирается по сборке)");
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.config.java_path)
                                     .desired_width(570.0)
-                                    .hint_text("Авто (будет найдена автоматически)"),
+                                    .hint_text("Авто: найти или скачать подходящую Java"),
                             );
                             if ui.button("Определить").clicked() {
                                 self.refresh_java_label();
@@ -2591,7 +2621,7 @@ fn java_status(configured: &str) -> String {
                 .unwrap_or_else(|| path.to_string_lossy().to_string());
             format!("Найдена: {version}")
         }
-        None => "Java не найдена — установите Java 17 или 21".into(),
+        None => "Java пока не установлена — скачается автоматически при запуске".into(),
     }
 }
 

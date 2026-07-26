@@ -11,8 +11,11 @@ pub enum LauncherError {
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Java не найдена. Установите Java 17+ (или 21) и перезапустите лаунчер.")]
+    #[error("Java не найдена, а автоматически скачать подходящую версию не удалось.")]
     JavaNotFound,
+
+    #[error("Java: {0}")]
+    Java(String),
 
     #[error("Версия не найдена: {0}")]
     VersionNotFound(String),
