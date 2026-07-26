@@ -49,7 +49,7 @@ impl SkinModel {
 #[serde(default)]
 pub struct AccountConfig {
     pub username: String,
-    /// Имя Minecraft-профиля или публичный HTTPS URL PNG-скина.
+    /// Локальный PNG-файл, имя Minecraft-профиля или публичный HTTPS URL скина.
     pub skin_source: String,
     pub skin_model: SkinModel,
 }

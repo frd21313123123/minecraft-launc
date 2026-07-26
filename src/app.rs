@@ -74,6 +74,7 @@ pub struct MineLauncherApp {
     config: Config,
     username: String,
     ram_mb: u32,
+    steve_texture: egui::TextureHandle,
     builds: Vec<BuildInfo>,
     selected_idx: usize,
     java_label: String,
@@ -96,6 +97,8 @@ pub struct MineLauncherApp {
     console_filter: String,
     last_log_refresh: Instant,
     skin_editor_open: bool,
+    skin_source_draft: String,
+    skin_model_draft: SkinModel,
     account_draft: AccountConfig,
     editing_account: Option<usize>,
     account_message: String,
@@ -108,6 +111,14 @@ impl MineLauncherApp {
         set_builds_root(configured_builds_root(&config));
         let _ = ensure_dirs();
         configure_style(&cc.egui_ctx, config.theme);
+        let steve_texture = config
+            .accounts
+            .get(config.active_account)
+            .filter(|account| is_local_skin_source(&account.skin_source))
+            .and_then(|account| {
+                load_skin_texture(&cc.egui_ctx, Path::new(&account.skin_source)).ok()
+            })
+            .unwrap_or_else(|| load_steve_texture(&cc.egui_ctx));
         let storage_path_edit = display_builds_root(&config);
         let (tx, rx) = mpsc::channel();
 
@@ -121,6 +132,7 @@ impl MineLauncherApp {
         let mut app = Self {
             username,
             ram_mb: config.ram_mb.clamp(1024, 16384),
+            steve_texture,
             config,
             builds: Vec::new(),
             selected_idx: 0,
@@ -144,6 +156,8 @@ impl MineLauncherApp {
             console_filter: String::new(),
             last_log_refresh: Instant::now() - Duration::from_secs(5),
             skin_editor_open: false,
+            skin_source_draft: String::new(),
+            skin_model_draft: SkinModel::Classic,
             account_draft: empty_account(),
             editing_account: None,
             account_message: String::new(),
@@ -1156,7 +1170,7 @@ impl MineLauncherApp {
             Pos2::new(left.center().x, left.center().y - 38.0),
             Vec2::new(left.width() * 0.78, (left.height() - 170.0).max(330.0)),
         );
-        draw_skin_avatar_3d(ui.painter(), model_rect, palette);
+        draw_skin_avatar_3d(ui.painter(), self.steve_texture.id(), model_rect, palette);
 
         let profile_y = left.bottom() - 89.0;
         ui.painter().text(
@@ -1181,7 +1195,7 @@ impl MineLauncherApp {
             Pos2::new(left.center().x, left.bottom() - 38.0),
             Vec2::new((left.width() - 12.0).min(360.0), 36.0),
         );
-        let can_apply = !account.skin_source.trim().is_empty();
+        let can_apply = can_apply_skin_source(&account.skin_source);
         let apply_response =
             ui.interact(apply_rect, ui.id().with("apply_skin"), Sense::click());
         ui.painter().rect_filled(
@@ -1295,6 +1309,8 @@ impl MineLauncherApp {
             palette.muted,
         );
         if new_response.clicked() {
+            self.skin_source_draft = account.skin_source.clone();
+            self.skin_model_draft = account.skin_model;
             self.skin_editor_open = true;
         }
 
@@ -1312,7 +1328,7 @@ impl MineLauncherApp {
                 saved_skin.center() - Vec2::new(0.0, 15.0),
                 Vec2::new(84.0, 105.0),
             );
-            draw_skin_avatar_3d(ui.painter(), mini_model, palette);
+            draw_skin_avatar_3d(ui.painter(), self.steve_texture.id(), mini_model, palette);
             ui.painter().text(
                 saved_skin.center_bottom() - Vec2::new(0.0, 16.0),
                 Align2::CENTER_BOTTOM,
@@ -1342,10 +1358,9 @@ impl MineLauncherApp {
 
         if self.skin_editor_open {
             let mut open = true;
-            let mut source = account.skin_source.clone();
-            let mut model = account.skin_model;
             let mut save_clicked = false;
             let mut copy_clicked = false;
+            let mut browse_clicked = false;
             egui::Window::new("Новый скин")
                 .open(&mut open)
                 .collapsible(false)
@@ -1353,60 +1368,108 @@ impl MineLauncherApp {
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .default_width(430.0)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Ник Minecraft или публичная HTTPS-ссылка на PNG");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut source)
-                            .desired_width(390.0)
-                            .hint_text("Notch или https://…/skin.png"),
-                    );
+                    ui.label("PNG-файл, ник Minecraft или публичная HTTPS-ссылка");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.skin_source_draft)
+                                .desired_width(306.0)
+                                .hint_text("Выберите файл или укажите ссылку"),
+                        );
+                        browse_clicked = ui.button("Обзор…").clicked();
+                    });
                     ui.add_space(8.0);
                     egui::ComboBox::from_id_salt("skin_library_model")
-                        .selected_text(model.label())
+                        .selected_text(self.skin_model_draft.label())
                         .width(220.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
-                                &mut model,
+                                &mut self.skin_model_draft,
                                 SkinModel::Classic,
                                 SkinModel::Classic.label(),
                             );
                             ui.selectable_value(
-                                &mut model,
+                                &mut self.skin_model_draft,
                                 SkinModel::Slim,
                                 SkinModel::Slim.label(),
                             );
                         });
                     ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(skin_command(&AccountConfig {
-                            username: account.username.clone(),
-                            skin_source: source.clone(),
-                            skin_model: model,
-                        }))
-                        .monospace()
-                        .color(palette.accent_text),
-                    );
+                    if is_local_skin_source(&self.skin_source_draft) {
+                        ui.label(
+                            RichText::new(
+                                "Локальный файл будет сохранён в библиотеке. Для SkinRestorer \
+                                 нужна публичная ссылка или ник.",
+                            )
+                            .color(palette.muted),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(skin_command(&AccountConfig {
+                                username: account.username.clone(),
+                                skin_source: self.skin_source_draft.clone(),
+                                skin_model: self.skin_model_draft,
+                            }))
+                            .monospace()
+                            .color(palette.accent_text),
+                        );
+                    }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         save_clicked = ui.button("Сохранить в библиотеку").clicked();
-                        copy_clicked = ui.button("Копировать команду").clicked();
+                        copy_clicked = ui
+                            .add_enabled(
+                                !is_local_skin_source(&self.skin_source_draft),
+                                egui::Button::new("Копировать команду"),
+                            )
+                            .clicked();
                     });
                 });
+            if browse_clicked {
+                if let Some(path) = select_skin_file() {
+                    match load_skin_texture(ui.ctx(), &path) {
+                        Ok(texture) => {
+                            self.steve_texture = texture;
+                            self.skin_source_draft = path.to_string_lossy().to_string();
+                            self.account_message =
+                                format!("Выбран скин: {}", skin_file_name(&path));
+                        }
+                        Err(error) => self.account_message = error,
+                    }
+                }
+            }
             if copy_clicked {
                 ui.ctx().copy_text(skin_command(&AccountConfig {
                     username: account.username.clone(),
-                    skin_source: source.clone(),
-                    skin_model: model,
+                    skin_source: self.skin_source_draft.clone(),
+                    skin_model: self.skin_model_draft,
                 }));
                 self.account_message = "Команда SkinRestorer скопирована".into();
             }
             if save_clicked {
-                if let Some(active) = self.config.accounts.get_mut(self.config.active_account) {
-                    active.skin_source = source.trim().to_string();
-                    active.skin_model = model;
+                let source = self.skin_source_draft.trim().to_string();
+                let valid_source = if is_local_skin_source(&source) {
+                    match load_skin_texture(ui.ctx(), Path::new(&source)) {
+                        Ok(texture) => {
+                            self.steve_texture = texture;
+                            true
+                        }
+                        Err(error) => {
+                            self.account_message = error;
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if valid_source {
+                    if let Some(active) = self.config.accounts.get_mut(self.config.active_account) {
+                        active.skin_source = source;
+                        active.skin_model = self.skin_model_draft;
+                    }
+                    let _ = self.config.save();
+                    self.account_message = "Скин сохранён в библиотеке".into();
+                    open = false;
                 }
-                let _ = self.config.save();
-                self.account_message = "Скин сохранён в библиотеке".into();
-                open = false;
             }
             self.skin_editor_open = open;
         }
@@ -2209,6 +2272,49 @@ fn skin_command(account: &AccountConfig) -> String {
     }
 }
 
+fn is_local_skin_source(source: &str) -> bool {
+    let source = source.trim();
+    !source.is_empty()
+        && !source.starts_with("https://")
+        && !source.starts_with("http://")
+        && (Path::new(source).is_absolute()
+            || source.to_ascii_lowercase().ends_with(".png")
+            || source.contains('\\')
+            || source.contains('/'))
+}
+
+fn can_apply_skin_source(source: &str) -> bool {
+    !source.trim().is_empty() && !is_local_skin_source(source)
+}
+
+fn validate_skin_file(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("Выбранный файл не найден".into());
+    }
+    let is_png = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !is_png {
+        return Err("Выберите скин в формате PNG".into());
+    }
+    let (width, height) =
+        image::image_dimensions(path).map_err(|_| "Не удалось прочитать PNG-файл".to_string())?;
+    if (width, height) != (64, 64) && (width, height) != (64, 32) {
+        return Err(format!(
+            "Неверный размер скина: {width}×{height}. Нужен PNG 64×64 или 64×32"
+        ));
+    }
+    Ok(())
+}
+
+fn skin_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("skin.png")
+        .to_string()
+}
+
 fn java_status(configured: &str) -> String {
     match find_java(configured) {
         Some(path) => {
@@ -2529,185 +2635,257 @@ fn paint_minecraft_placeholder(painter: &egui::Painter, rect: Rect, palette: Pal
     );
 }
 
-fn draw_skin_avatar_3d(painter: &egui::Painter, rect: Rect, _palette: Palette) {
-    let scale = (rect.height() / 350.0)
-        .min(rect.width() / 190.0)
-        .clamp(0.22, 1.25);
-    let center = rect.center() + Vec2::new(-8.0 * scale, 4.0 * scale);
-    let depth = 13.0 * scale;
-    let skin = Color32::from_rgb(174, 116, 83);
-    let skin_top = Color32::from_rgb(207, 151, 112);
-    let skin_side = Color32::from_rgb(137, 84, 62);
-    let shirt = Color32::from_rgb(0, 170, 178);
-    let shirt_top = Color32::from_rgb(28, 202, 196);
-    let shirt_side = Color32::from_rgb(0, 126, 142);
-    let trousers = Color32::from_rgb(57, 57, 181);
-    let trousers_top = Color32::from_rgb(74, 70, 211);
-    let trousers_side = Color32::from_rgb(42, 42, 139);
-
-    let head = Rect::from_center_size(
-        center + Vec2::new(0.0, -126.0 * scale),
-        Vec2::splat(62.0 * scale),
-    );
-    draw_iso_block(
-        painter,
-        head,
-        depth,
-        skin,
-        skin_top,
-        skin_side,
-    );
-    painter.rect_filled(
-        Rect::from_min_size(head.min, Vec2::new(head.width(), 17.0 * scale)),
-        CornerRadius::ZERO,
-        Color32::from_rgb(69, 43, 27),
-    );
-    painter.rect_filled(
-        Rect::from_min_size(
-            head.min + Vec2::new(0.0, 14.0 * scale),
-            Vec2::new(10.0 * scale, 25.0 * scale),
-        ),
-        CornerRadius::ZERO,
-        Color32::from_rgb(82, 49, 30),
-    );
-    for x in [17.0, 43.0] {
-        painter.rect_filled(
-            Rect::from_min_size(
-                head.min + Vec2::new(x * scale, 28.0 * scale),
-                Vec2::new(8.0 * scale, 6.0 * scale),
-            ),
-            CornerRadius::ZERO,
-            Color32::from_rgb(101, 103, 182),
-        );
-    }
-    painter.rect_filled(
-        Rect::from_center_size(
-            head.center_bottom() - Vec2::new(0.0, 13.0 * scale),
-            Vec2::new(19.0 * scale, 6.0 * scale),
-        ),
-        CornerRadius::ZERO,
-        Color32::from_rgb(101, 57, 45),
-    );
-
-    let body = Rect::from_center_size(
-        center + Vec2::new(0.0, -50.0 * scale),
-        Vec2::new(66.0 * scale, 92.0 * scale),
-    );
-    draw_iso_block(
-        painter,
-        body,
-        depth,
-        shirt,
-        shirt_top,
-        shirt_side,
-    );
-
-    let left_arm = Rect::from_center_size(
-        center + Vec2::new(-52.0 * scale, -43.0 * scale),
-        Vec2::new(28.0 * scale, 102.0 * scale),
-    );
-    let right_arm = Rect::from_center_size(
-        center + Vec2::new(52.0 * scale, -43.0 * scale),
-        Vec2::new(28.0 * scale, 102.0 * scale),
-    );
-    draw_iso_block(
-        painter,
-        left_arm,
-        depth * 0.72,
-        skin,
-        shirt_top,
-        skin_side,
-    );
-    draw_iso_block(
-        painter,
-        right_arm,
-        depth * 0.72,
-        skin,
-        shirt_top,
-        skin_side,
-    );
-    painter.rect_filled(
-        Rect::from_min_size(
-            left_arm.min,
-            Vec2::new(left_arm.width(), 25.0 * scale),
-        ),
-        CornerRadius::ZERO,
-        shirt,
-    );
-    painter.rect_filled(
-        Rect::from_min_size(
-            right_arm.min,
-            Vec2::new(right_arm.width(), 25.0 * scale),
-        ),
-        CornerRadius::ZERO,
-        shirt,
-    );
-
-    let left_leg = Rect::from_center_size(
-        center + Vec2::new(-18.0 * scale, 59.0 * scale),
-        Vec2::new(31.0 * scale, 112.0 * scale),
-    );
-    let right_leg = Rect::from_center_size(
-        center + Vec2::new(18.0 * scale, 59.0 * scale),
-        Vec2::new(31.0 * scale, 112.0 * scale),
-    );
-    draw_iso_block(
-        painter,
-        left_leg,
-        depth * 0.78,
-        trousers,
-        trousers_top,
-        trousers_side,
-    );
-    draw_iso_block(
-        painter,
-        right_leg,
-        depth * 0.78,
-        trousers,
-        trousers_top,
-        trousers_side,
-    );
-    for leg in [left_leg, right_leg] {
-        painter.rect_filled(
-            Rect::from_min_size(
-                Pos2::new(leg.left(), leg.bottom() - 18.0 * scale),
-                Vec2::new(leg.width(), 18.0 * scale),
-            ),
-            CornerRadius::ZERO,
-            Color32::from_rgb(73, 77, 78),
-        );
-    }
+fn load_steve_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let image = image::load_from_memory(include_bytes!(
+        "../assets/minecraft/textures/entity/player/wide/steve.png"
+    ))
+    .expect("embedded Steve skin must be a valid PNG")
+    .to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    ctx.load_texture(
+        "minecraft:entity/player/wide/steve",
+        color_image,
+        egui::TextureOptions::NEAREST,
+    )
 }
 
-fn draw_iso_block(
+fn load_skin_texture(ctx: &egui::Context, path: &Path) -> Result<egui::TextureHandle, String> {
+    validate_skin_file(path)?;
+    let mut image = image::open(path)
+        .map_err(|_| "Не удалось прочитать PNG-файл".to_string())?
+        .to_rgba8();
+
+    // Старые скины 64×32 используют одну текстуру для обеих рук и ног.
+    // Дублируем эти области в позиции современного формата 64×64, чтобы
+    // превью не теряло половину модели.
+    if image.height() == 32 {
+        let mut expanded = image::RgbaImage::new(64, 64);
+        image::imageops::overlay(&mut expanded, &image, 0, 0);
+        for y in 0..16 {
+            for x in 0..16 {
+                expanded.put_pixel(x + 16, y + 48, *image.get_pixel(x, y + 16));
+                expanded.put_pixel(x + 32, y + 48, *image.get_pixel(x + 40, y + 16));
+            }
+        }
+        image = expanded;
+    }
+
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Ok(ctx.load_texture(
+        format!("skin:{}", path.to_string_lossy()),
+        color_image,
+        egui::TextureOptions::NEAREST,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct SkinFaces {
+    front: [f32; 4],
+    right: [f32; 4],
+    top: [f32; 4],
+}
+
+fn draw_skin_avatar_3d(
     painter: &egui::Painter,
+    texture: egui::TextureId,
+    rect: Rect,
+    _palette: Palette,
+) {
+    // Minecraft's classic model is 16 px wide and 32 px tall. Keep those exact
+    // proportions and only add a small isometric depth so the preview reads as 3D.
+    let unit = (rect.height() / 34.0)
+        .min(rect.width() / 18.0)
+        .clamp(1.7, 10.5);
+    let depth = unit * 1.25;
+    let model_size = Vec2::new(unit * 16.0 + depth, unit * 32.0 + depth * 0.55);
+    let origin = rect.center() - model_size * 0.5 + Vec2::new(-depth * 0.15, depth * 0.28);
+
+    let shadow = Rect::from_center_size(
+        Pos2::new(
+            rect.center().x + depth * 0.35,
+            origin.y + unit * 32.0 + depth * 0.2,
+        ),
+        Vec2::new(unit * 12.5, unit * 1.25),
+    );
+    painter.rect_filled(
+        shadow,
+        CornerRadius::same((unit * 0.6).round().clamp(1.0, 255.0) as u8),
+        Color32::from_rgba_unmultiplied(0, 0, 0, 72),
+    );
+
+    let head = Rect::from_min_size(origin + Vec2::new(unit * 4.0, 0.0), Vec2::splat(unit * 8.0));
+    let body = Rect::from_min_size(
+        origin + Vec2::new(unit * 4.0, unit * 8.0),
+        Vec2::new(unit * 8.0, unit * 12.0),
+    );
+    let screen_left_arm = Rect::from_min_size(
+        origin + Vec2::new(0.0, unit * 8.0),
+        Vec2::new(unit * 4.0, unit * 12.0),
+    );
+    let screen_right_arm = Rect::from_min_size(
+        origin + Vec2::new(unit * 12.0, unit * 8.0),
+        Vec2::new(unit * 4.0, unit * 12.0),
+    );
+    let screen_left_leg = Rect::from_min_size(
+        origin + Vec2::new(unit * 4.0, unit * 20.0),
+        Vec2::new(unit * 4.0, unit * 12.0),
+    );
+    let screen_right_leg = Rect::from_min_size(
+        origin + Vec2::new(unit * 8.0, unit * 20.0),
+        Vec2::new(unit * 4.0, unit * 12.0),
+    );
+
+    // Render the outer face of each arm away from the torso. Using the same
+    // depth direction for both arms makes the left arm fold into the body.
+    draw_skin_cuboid(
+        painter,
+        texture,
+        screen_right_arm,
+        depth * 0.52,
+        SkinFaces {
+            front: [36.0, 52.0, 40.0, 64.0],
+            right: [40.0, 52.0, 44.0, 64.0],
+            top: [36.0, 48.0, 40.0, 52.0],
+        },
+    );
+    draw_skin_cuboid(
+        painter,
+        texture,
+        screen_right_leg,
+        depth * 0.52,
+        SkinFaces {
+            front: [20.0, 52.0, 24.0, 64.0],
+            right: [16.0, 52.0, 20.0, 64.0],
+            top: [20.0, 48.0, 24.0, 52.0],
+        },
+    );
+    draw_skin_cuboid(
+        painter,
+        texture,
+        screen_left_leg,
+        depth * 0.52,
+        SkinFaces {
+            front: [4.0, 20.0, 8.0, 32.0],
+            right: [0.0, 20.0, 4.0, 32.0],
+            top: [4.0, 16.0, 8.0, 20.0],
+        },
+    );
+    draw_skin_cuboid(
+        painter,
+        texture,
+        body,
+        depth,
+        SkinFaces {
+            front: [20.0, 20.0, 28.0, 32.0],
+            right: [16.0, 20.0, 20.0, 32.0],
+            top: [20.0, 16.0, 28.0, 20.0],
+        },
+    );
+    draw_skin_cuboid(
+        painter,
+        texture,
+        screen_left_arm,
+        -depth * 0.52,
+        SkinFaces {
+            front: [44.0, 20.0, 48.0, 32.0],
+            right: [40.0, 20.0, 44.0, 32.0],
+            top: [44.0, 16.0, 48.0, 20.0],
+        },
+    );
+    draw_skin_cuboid(
+        painter,
+        texture,
+        head,
+        depth,
+        SkinFaces {
+            front: [8.0, 8.0, 16.0, 16.0],
+            right: [0.0, 8.0, 8.0, 16.0],
+            top: [8.0, 0.0, 16.0, 8.0],
+        },
+    );
+}
+
+fn draw_skin_cuboid(
+    painter: &egui::Painter,
+    texture: egui::TextureId,
     front: Rect,
     depth: f32,
-    front_color: Color32,
-    top_color: Color32,
-    side_color: Color32,
+    faces: SkinFaces,
 ) {
-    painter.rect_filled(front, CornerRadius::ZERO, front_color);
-    painter.add(egui::Shape::convex_polygon(
-        vec![
+    let offset = Vec2::new(depth, -depth.abs() * 0.55);
+    let mut mesh = egui::Mesh::with_texture(texture);
+
+    add_skin_quad(
+        &mut mesh,
+        [
+            front.left_top() + offset,
+            front.right_top() + offset,
             front.left_top(),
-            front.left_top() + Vec2::new(depth, -depth * 0.55),
-            front.right_top() + Vec2::new(depth, -depth * 0.55),
             front.right_top(),
         ],
-        top_color,
-        Stroke::NONE,
-    ));
-    painter.add(egui::Shape::convex_polygon(
-        vec![
+        faces.top,
+        Color32::WHITE,
+    );
+    let side = if depth >= 0.0 {
+        [
             front.right_top(),
-            front.right_top() + Vec2::new(depth, -depth * 0.55),
-            front.right_bottom() + Vec2::new(depth, -depth * 0.55),
+            front.right_top() + offset,
+            front.right_bottom(),
+            front.right_bottom() + offset,
+        ]
+    } else {
+        [
+            front.left_top() + offset,
+            front.left_top(),
+            front.left_bottom() + offset,
+            front.left_bottom(),
+        ]
+    };
+    add_skin_quad(
+        &mut mesh,
+        side,
+        faces.right,
+        Color32::from_rgb(174, 174, 174),
+    );
+    add_skin_quad(
+        &mut mesh,
+        [
+            front.left_top(),
+            front.right_top(),
+            front.left_bottom(),
             front.right_bottom(),
         ],
-        side_color,
-        Stroke::NONE,
-    ));
+        faces.front,
+        Color32::WHITE,
+    );
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+fn add_skin_quad(
+    mesh: &mut egui::Mesh,
+    points: [Pos2; 4],
+    texture_pixels: [f32; 4],
+    tint: Color32,
+) {
+    let index = mesh.vertices.len() as u32;
+    let [u0, v0, u1, v1] = texture_pixels;
+    let uvs = [
+        Pos2::new(u0 / 64.0, v0 / 64.0),
+        Pos2::new(u1 / 64.0, v0 / 64.0),
+        Pos2::new(u0 / 64.0, v1 / 64.0),
+        Pos2::new(u1 / 64.0, v1 / 64.0),
+    ];
+    for (pos, uv) in points.into_iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos,
+            uv,
+            color: tint,
+        });
+    }
+    mesh.add_triangle(index, index + 1, index + 2);
+    mesh.add_triangle(index + 2, index + 1, index + 3);
 }
 
 fn draw_dashed_rect(painter: &egui::Painter, rect: Rect, color: Color32) {
@@ -2855,6 +3033,33 @@ fn select_folder() -> Option<PathBuf> {
     (!selected.is_empty()).then(|| PathBuf::from(selected))
 }
 
+#[cfg(windows)]
+fn select_skin_file() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = concat!(
+        "Add-Type -AssemblyName System.Windows.Forms; ",
+        "$dialog = New-Object System.Windows.Forms.OpenFileDialog; ",
+        "$dialog.Title = 'Выберите скин Minecraft'; ",
+        "$dialog.Filter = 'PNG-скины (*.png)|*.png'; ",
+        "$dialog.CheckFileExists = $true; ",
+        "$dialog.Multiselect = $false; ",
+        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { ",
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ",
+        "Write-Output $dialog.FileName }"
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!selected.is_empty()).then(|| PathBuf::from(selected))
+}
+
 #[cfg(not(windows))]
 fn select_folder() -> Option<PathBuf> {
     let output = std::process::Command::new("zenity")
@@ -2862,6 +3067,20 @@ fn select_folder() -> Option<PathBuf> {
             "--file-selection",
             "--directory",
             "--title=Папка MineLauncher",
+        ])
+        .output()
+        .ok()?;
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !selected.is_empty()).then(|| PathBuf::from(selected))
+}
+
+#[cfg(not(windows))]
+fn select_skin_file() -> Option<PathBuf> {
+    let output = std::process::Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--title=Выберите скин Minecraft",
+            "--file-filter=PNG-скины | *.png",
         ])
         .output()
         .ok()?;
