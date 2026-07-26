@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::download::{self, download_file, ProgressFn};
 use crate::error::LauncherError;
-use crate::java::find_java;
+use crate::java::{ensure_java, neoforge_java_major};
 use crate::paths::{ensure_dirs, game_dir, versions_dir};
 
 #[cfg(windows)]
@@ -43,21 +43,28 @@ pub fn install_neoforge(
         return Ok(version_id);
     }
 
-    let java = find_java(java_path).ok_or(LauncherError::JavaNotFound)?;
+    let java = ensure_java(
+        java_path,
+        neoforge_java_major(neoforge_ver),
+        Some(&progress),
+        Some(cancel.as_ref()),
+    )?;
     let client = download::http_client()?;
 
     let installer_name = format!("neoforge-{neoforge_ver}-installer.jar");
     let installer_url = format!(
         "https://maven.neoforged.net/releases/net/neoforged/neoforge/{neoforge_ver}/{installer_name}"
     );
-    let installer_path = crate::paths::app_dir()
-        .join("cache")
-        .join(&installer_name);
+    let installer_path = crate::paths::app_dir().join("cache").join(&installer_name);
     if let Some(parent) = installer_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    progress(0, 1, &format!("Скачивание NeoForge installer {neoforge_ver}…"));
+    progress(
+        0,
+        1,
+        &format!("Скачивание NeoForge installer {neoforge_ver}…"),
+    );
     download_file(
         &client,
         &installer_url,
@@ -77,7 +84,11 @@ pub fn install_neoforge(
     // Официальный installer требует launcher_profiles.json (как у лаунчера Mojang).
     ensure_launcher_profiles(&target)?;
 
-    progress(0, 1, &format!("Установка NeoForge {neoforge_ver} (это может занять несколько минут)…"));
+    progress(
+        0,
+        1,
+        &format!("Установка NeoForge {neoforge_ver} (это может занять несколько минут)…"),
+    );
 
     let mut cmd = Command::new(&java);
     cmd.arg("-jar")
@@ -161,5 +172,3 @@ fn ensure_launcher_profiles(mc_dir: &std::path::Path) -> Result<(), LauncherErro
     std::fs::write(path, json)?;
     Ok(())
 }
-
-

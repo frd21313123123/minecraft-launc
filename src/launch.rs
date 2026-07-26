@@ -6,11 +6,9 @@ use uuid::Uuid;
 
 use crate::error::LauncherError;
 use crate::install::{client_jar_path, library_classpath_path, load_version_json};
-use crate::java::find_java;
+use crate::java::{ensure_java, required_java_major};
 use crate::models::VersionJson;
-use crate::paths::{
-    assets_dir, ensure_dirs, game_dir, natives_dir, APP_NAME, LAUNCHER_VERSION,
-};
+use crate::paths::{assets_dir, ensure_dirs, game_dir, natives_dir, APP_NAME, LAUNCHER_VERSION};
 use crate::rules::expand_argument;
 
 #[cfg(windows)]
@@ -18,6 +16,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn offline_uuid(username: &str) -> String {
     // UUID v3 DNS namespace — same as Java UUID.nameUUIDFromBytes offline
@@ -68,8 +68,13 @@ pub fn build_launch_command_with_dir(
         u.chars().take(16).collect::<String>()
     };
 
-    let java = find_java(java_path).ok_or(LauncherError::JavaNotFound)?;
     let version = load_version_json(version_id)?;
+    let java = ensure_java(
+        java_path,
+        required_java_major(&version, version_id),
+        None,
+        None,
+    )?;
     let natives = natives_dir(version_id);
     let assets = assets_dir();
     let client_jar = client_jar_path(&version);
@@ -145,7 +150,11 @@ pub fn build_launch_command_with_dir(
     );
     vars.insert(
         "classpath_separator".into(),
-        if cfg!(windows) { ";".into() } else { ":".into() },
+        if cfg!(windows) {
+            ";".into()
+        } else {
+            ":".into()
+        },
     );
 
     let mut cmd: Vec<String> = Vec::new();
@@ -340,7 +349,7 @@ pub fn launch_game_with_dir(
 
     #[cfg(windows)]
     {
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let mut child = cmd
@@ -365,7 +374,9 @@ pub fn launch_game_with_dir(
             }
             Ok(None) => {}
             Err(e) => {
-                return Err(LauncherError::Other(format!("Ошибка ожидания процесса: {e}")));
+                return Err(LauncherError::Other(format!(
+                    "Ошибка ожидания процесса: {e}"
+                )));
             }
         }
     }
@@ -389,4 +400,3 @@ fn read_log_tail(path: &Path, max_chars: usize) -> String {
     let start = chars.len() - max_chars;
     format!("…{}", chars[start..].iter().collect::<String>())
 }
-
