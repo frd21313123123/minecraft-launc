@@ -29,8 +29,7 @@ pub fn download_json<T: serde::de::DeserializeOwned>(
         .map_err(|e| LauncherError::Network(e.to_string()))?
         .error_for_status()
         .map_err(|e| LauncherError::Network(e.to_string()))?;
-    resp.json()
-        .map_err(|e| LauncherError::Parse(e.to_string()))
+    resp.json().map_err(|e| LauncherError::Parse(e.to_string()))
 }
 
 /// Скачивает файл, если его нет или sha1 не совпадает.
@@ -42,11 +41,13 @@ pub fn download_file(
     progress: Option<&ProgressFn>,
     label: &str,
 ) -> Result<(), LauncherError> {
+    let mut replace_existing = false;
     if dest.exists() {
         if let Some(sha) = expected_sha1 {
             if verify_sha1(dest, sha)? {
                 return Ok(());
             }
+            replace_existing = true;
         } else {
             return Ok(());
         }
@@ -100,6 +101,11 @@ pub fn download_file(
         }
     }
 
+    // Windows does not replace an existing destination with `rename`. Only remove
+    // the old file after the replacement has been fully downloaded and verified.
+    if replace_existing {
+        fs::remove_file(dest)?;
+    }
     fs::rename(&tmp, dest)?;
     Ok(())
 }
