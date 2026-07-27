@@ -336,6 +336,18 @@ impl MineLauncherApp {
         self.builds.get(self.selected_idx)
     }
 
+    fn select_build(&mut self, index: usize) {
+        let Some(build_id) = self.builds.get(index).map(|build| build.id.clone()) else {
+            return;
+        };
+
+        self.selected_idx = index;
+        if self.config.last_build != build_id {
+            self.config.last_build = build_id;
+            let _ = self.config.save();
+        }
+    }
+
     fn validate_username(username: &str) -> Result<(), String> {
         let username = username.trim();
         if username.is_empty() {
@@ -658,11 +670,12 @@ impl MineLauncherApp {
                 WorkerMsg::BuildsOk(builds) => {
                     self.builds = builds;
                     self.busy = Busy::Idle;
-                    self.selected_idx = self
+                    let selected_idx = self
                         .builds
                         .iter()
                         .position(|build| build.id == self.config.last_build)
                         .unwrap_or(0);
+                    self.select_build(selected_idx);
                     if self.builds.is_empty() {
                         self.status = "Сборок пока нет".into();
                         self.detail = "Добавьте архивы в настроенную папку Google Drive".into();
@@ -1068,49 +1081,117 @@ impl MineLauncherApp {
             self.navigate_to(ui.ctx(), Page::Settings, Some(SettingsTab::Accounts));
         }
 
-        let server_rect = Rect::from_min_size(
-            Pos2::new(rect.left(), profile.bottom() + 10.0),
-            Vec2::new(rect.width(), 54.0),
-        );
-        let server_selected = matches!(self.page, Page::Home | Page::Skins | Page::Gallery);
-        if side_button(
-            ui,
-            server_rect,
-            "◆",
-            &self.config.server_name.to_uppercase(),
-            server_selected,
-            palette,
-        )
-        .clicked()
-        {
-            self.navigate_to(ui.ctx(), Page::Home, None);
-        }
-
-        let console_rect = server_rect.translate(Vec2::new(0.0, 64.0));
-        if side_button(
-            ui,
-            console_rect,
-            ">_",
-            "КОНСОЛЬ",
-            self.page == Page::Console,
-            palette,
-        )
-        .clicked()
-        {
-            self.navigate_to(ui.ctx(), Page::Console, None);
-            self.refresh_game_log();
-        }
-
         let settings_rect = Rect::from_min_size(
             Pos2::new(rect.left(), rect.bottom() - 64.0),
             Vec2::new(rect.width(), 46.0),
         );
+
+        let navigation_rect = Rect::from_min_max(
+            Pos2::new(rect.left(), profile.bottom() + 10.0),
+            Pos2::new(rect.right(), settings_rect.top() - 10.0),
+        );
+        let mut requested_build = None;
+        let mut console_clicked = false;
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(navigation_rect)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_builds")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(navigation_rect.width());
+
+                        if self.builds.is_empty() {
+                            let (empty_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(navigation_rect.width(), 54.0),
+                                Sense::hover(),
+                            );
+                            let (icon, label) = if self.busy == Busy::LoadingBuilds {
+                                ("…", "ЗАГРУЗКА СБОРОК…")
+                            } else {
+                                ("◇", "СБОРКИ НЕ НАЙДЕНЫ")
+                            };
+                            ui.painter().text(
+                                Pos2::new(empty_rect.left() + 17.0, empty_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                icon,
+                                FontId::monospace(16.0),
+                                palette.muted,
+                            );
+                            ui.painter().text(
+                                Pos2::new(empty_rect.left() + 48.0, empty_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                truncate(label, 19),
+                                FontId::proportional(13.0),
+                                palette.muted,
+                            );
+                        } else {
+                            for (index, build) in self.builds.iter().enumerate() {
+                                let (build_rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(navigation_rect.width(), 54.0),
+                                    Sense::hover(),
+                                );
+                                let build_selected = self.selected_idx == index
+                                    && matches!(
+                                        self.page,
+                                        Page::Home | Page::Skins | Page::Gallery
+                                    );
+                                if side_button(
+                                    ui,
+                                    ("build", build.id.as_str()),
+                                    build_rect,
+                                    "◆",
+                                    &build.name.to_uppercase(),
+                                    build_selected,
+                                    self.busy == Busy::Idle,
+                                    palette,
+                                )
+                                .clicked()
+                                {
+                                    requested_build = Some(index);
+                                }
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        let (console_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(navigation_rect.width(), 54.0),
+                            Sense::hover(),
+                        );
+                        console_clicked = side_button(
+                            ui,
+                            "console",
+                            console_rect,
+                            ">_",
+                            "КОНСОЛЬ",
+                            self.page == Page::Console,
+                            true,
+                            palette,
+                        )
+                        .clicked();
+                    });
+            },
+        );
+
+        if let Some(index) = requested_build {
+            self.select_build(index);
+            self.navigate_to(ui.ctx(), Page::Home, None);
+        }
+        if console_clicked {
+            self.navigate_to(ui.ctx(), Page::Console, None);
+            self.refresh_game_log();
+        }
+
         if side_button(
             ui,
+            "settings",
             settings_rect,
             "⚙",
             "НАСТРОЙКИ",
             self.page == Page::Settings,
+            true,
             palette,
         )
         .clicked()
@@ -1351,6 +1432,7 @@ impl MineLauncherApp {
             Pos2::new(play_rect.left() - combo_width - 14.0, footer.center().y - 17.0),
             Vec2::new(combo_width, 34.0),
         );
+        let mut requested_build = None;
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
             ui.add_enabled_ui(self.busy == Busy::Idle, |ui| {
                 let selected = self
@@ -1374,12 +1456,15 @@ impl MineLauncherApp {
                                 )
                                 .clicked()
                             {
-                                self.selected_idx = index;
+                                requested_build = Some(index);
                             }
                         }
                     });
             });
         });
+        if let Some(index) = requested_build {
+            self.select_build(index);
+        }
     }
 
     fn draw_skins(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
@@ -2125,12 +2210,6 @@ impl MineLauncherApp {
 
                         ui.add_space(22.0);
                         section_title(ui, "СЕРВЕР И SKINSRESTORER", palette.muted);
-                        setting_row(ui, "Название:", |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.config.server_name)
-                                    .desired_width(310.0),
-                            );
-                        });
                         setting_row(ui, "Адрес сервера:", |ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.config.server_address)
@@ -3134,14 +3213,24 @@ fn animated_tab_indicator(
 
 fn side_button(
     ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
     rect: Rect,
     icon: &str,
     label: &str,
     selected: bool,
+    enabled: bool,
     palette: Palette,
 ) -> egui::Response {
-    let id = ui.id().with(("side", label));
-    let response = ui.interact(rect, id, Sense::click());
+    let id = ui.id().with(("side", id_source));
+    let response = ui.interact(
+        rect,
+        id,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
     let selected_t = ui
         .ctx()
         .animate_bool_with_time(id.with("selected"), selected, 0.18);
@@ -3177,7 +3266,9 @@ fn side_button(
             ),
         );
     }
-    let color = if selected || response.hovered() {
+    let color = if !enabled {
+        palette.disabled
+    } else if selected || response.hovered() {
         palette.text
     } else {
         palette.muted
