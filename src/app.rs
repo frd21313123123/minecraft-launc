@@ -626,6 +626,15 @@ impl MineLauncherApp {
         });
     }
 
+    fn stop_installation(&mut self) {
+        if self.busy != Busy::Installing || self.cancel.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.status = "Останавливаем загрузку…".into();
+        self.detail = "Завершаем текущую операцию".into();
+        self.append_log("Пользователь остановил загрузку сборки");
+    }
+
     fn refresh_java_label(&mut self) {
         self.java_label = java_status(&self.config.java_path);
     }
@@ -665,6 +674,9 @@ impl MineLauncherApp {
                     self.append_log(format!("Ошибка каталога: {error}"));
                 }
                 WorkerMsg::Progress { done, total, label } => {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     self.status = label;
                     if total > 0 {
                         self.progress_indeterminate = false;
@@ -683,6 +695,9 @@ impl MineLauncherApp {
                     }
                 }
                 WorkerMsg::Status(status) => {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     self.status = status.clone();
                     self.detail = "Операция выполняется…".into();
                     self.progress_indeterminate = true;
@@ -693,6 +708,7 @@ impl MineLauncherApp {
                     username,
                     skin_sync,
                 } => {
+                    self.cancel.store(false, Ordering::Relaxed);
                     self.refresh_java_label();
                     self.busy = Busy::Idle;
                     self.progress = 1.0;
@@ -715,14 +731,22 @@ impl MineLauncherApp {
                     self.refresh_game_log();
                 }
                 WorkerMsg::DoneErr(error) => {
+                    let was_cancelled =
+                        self.cancel.swap(false, Ordering::Relaxed) || error == "Отменено";
                     self.refresh_java_label();
                     self.busy = Busy::Idle;
                     self.progress = 0.0;
                     self.progress_indeterminate = false;
                     self.progress_text.clear();
-                    self.status = "Ошибка запуска".into();
-                    self.detail = error.clone();
-                    self.append_log(format!("Ошибка: {error}"));
+                    if was_cancelled {
+                        self.status = "Загрузка остановлена".into();
+                        self.detail = "Можно запустить установку снова".into();
+                        self.append_log("Загрузка сборки остановлена");
+                    } else {
+                        self.status = "Ошибка запуска".into();
+                        self.detail = error.clone();
+                        self.append_log(format!("Ошибка: {error}"));
+                    }
                     self.refresh_game_log();
                 }
             }
@@ -744,7 +768,7 @@ impl MineLauncherApp {
                     .map(|extension| {
                         matches!(
                             extension.to_ascii_lowercase().as_str(),
-                            "png" | "jpg" | "jpeg"
+                            "png" | "jpg" | "jpeg" | "webp"
                         )
                     })
                     .unwrap_or(false)
@@ -791,7 +815,7 @@ impl MineLauncherApp {
         }
         self.gallery = gallery;
         self.gallery_status = if self.gallery.is_empty() {
-            "Пока пусто — добавьте PNG или JPG".into()
+            "Пока пусто — добавьте PNG, JPG или WebP".into()
         } else if skipped > 0 {
             format!("Загружено: {} · пропущено: {skipped}", self.gallery.len())
         } else {
@@ -1272,9 +1296,13 @@ impl MineLauncherApp {
             Vec2::new(play_width, 46.0),
         );
         let can_play = self.busy == Busy::Idle && !self.builds.is_empty();
+        let can_stop = self.busy == Busy::Installing && !self.cancel.load(Ordering::Relaxed);
+        let button_enabled = can_play || can_stop;
         let play_response = ui.interact(play_rect, ui.id().with("home_play"), Sense::click());
-        let play_color = if !can_play {
+        let play_color = if !button_enabled {
             palette.disabled
+        } else if can_stop {
+            palette.danger
         } else if play_response.hovered() {
             palette.accent_hover
         } else {
@@ -1288,14 +1316,12 @@ impl MineLauncherApp {
             match self.busy {
                 Busy::Idle => "ИГРАТЬ".to_string(),
                 Busy::LoadingBuilds => "ЗАГРУЗКА…".into(),
-                Busy::Installing if !self.progress_indeterminate => {
-                    format!("УСТАНОВКА {:.0}%", self.progress * 100.0)
-                }
-                Busy::Installing => "УСТАНОВКА…".into(),
+                Busy::Installing if can_stop => "ОСТАНОВИТЬ".into(),
+                Busy::Installing => "ОСТАНАВЛИВАЕМ…".into(),
                 Busy::Launching => "ЗАПУСК…".into(),
             },
             FontId::proportional(14.0),
-            if can_play {
+            if button_enabled {
                 Color32::WHITE
             } else {
                 palette.muted
@@ -1303,6 +1329,8 @@ impl MineLauncherApp {
         );
         if can_play && play_response.clicked() {
             self.on_play();
+        } else if can_stop && play_response.clicked() {
+            self.stop_installation();
         }
 
         let combo_width = 190.0_f32.min((play_rect.left() - info_left - 20.0).max(120.0));
@@ -3680,7 +3708,7 @@ fn draw_empty_gallery(painter: &egui::Painter, rect: Rect, palette: Palette) {
     painter.text(
         card.center() + Vec2::new(0.0, 60.0),
         Align2::CENTER_CENTER,
-                    "Добавьте PNG или JPG в папку screenshots",
+        "Добавьте PNG, JPG или WebP в папку screenshots",
         FontId::proportional(12.0),
         palette.muted,
     );
