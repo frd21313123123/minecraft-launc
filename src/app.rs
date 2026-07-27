@@ -15,6 +15,9 @@ use mine_launcher::download::ProgressFn;
 use mine_launcher::drive::{self, BuildInfo};
 use mine_launcher::install::{self, is_version_installed};
 use mine_launcher::java::{ensure_java_for_version, find_java, java_version_string};
+use mine_launcher::memory::{
+    automatic_ram_mb, manual_ram_max_mb, total_memory_mb, MIN_RAM_MB, RAM_STEP_MB,
+};
 use mine_launcher::mmc::{self, ModLoader};
 use mine_launcher::neoforge;
 use mine_launcher::paths::{
@@ -85,6 +88,7 @@ pub struct MineLauncherApp {
     config: Config,
     username: String,
     ram_mb: u32,
+    total_ram_mb: Option<u32>,
     steve_texture: egui::TextureHandle,
     builds: Vec<BuildInfo>,
     selected_idx: usize,
@@ -143,10 +147,19 @@ impl MineLauncherApp {
             .get(config.active_account)
             .map(|account| account.username.clone())
             .unwrap_or_else(|| config.username.clone());
+        let total_ram_mb = total_memory_mb();
+        let ram_mb = if config.auto_ram {
+            total_ram_mb
+                .map(automatic_ram_mb)
+                .unwrap_or(config.ram_mb.max(MIN_RAM_MB))
+        } else {
+            config.ram_mb.max(MIN_RAM_MB)
+        };
 
         let mut app = Self {
             username,
-            ram_mb: config.ram_mb.clamp(1024, 16384),
+            ram_mb,
+            total_ram_mb,
             steve_texture,
             config,
             builds: Vec::new(),
@@ -2051,24 +2064,40 @@ impl MineLauncherApp {
 
                         ui.add_space(22.0);
                         section_title(ui, "НАСТРОЙКИ JAVA", palette.muted);
-                        ui.checkbox(
-                            &mut self.config.auto_ram,
-                            "Автоматическое определение RAM",
-                        );
+                        let auto_ram_changed = ui
+                            .checkbox(
+                                &mut self.config.auto_ram,
+                                "Автоматическое определение RAM",
+                            )
+                            .on_hover_text("Половина установленной RAM, но не больше 10 ГБ")
+                            .changed();
+                        if auto_ram_changed && self.config.auto_ram {
+                            if let Some(total_ram_mb) = self.total_ram_mb {
+                                self.ram_mb = automatic_ram_mb(total_ram_mb);
+                            }
+                        }
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.add_enabled_ui(!self.config.auto_ram, |ui| {
                                 let mut ram = self.ram_mb as f32;
+                                let manual_max = self
+                                    .total_ram_mb
+                                    .map(manual_ram_max_mb)
+                                    .unwrap_or(self.ram_mb.max(MIN_RAM_MB));
                                 if ui
                                     .add(
-                                        egui::Slider::new(&mut ram, 1024.0..=16384.0)
-                                            .step_by(512.0)
+                                        egui::Slider::new(
+                                            &mut ram,
+                                            MIN_RAM_MB as f32..=manual_max as f32,
+                                        )
+                                            .step_by(RAM_STEP_MB as f64)
                                             .show_value(false),
                                     )
                                     .changed()
                                 {
-                                    self.ram_mb = ((ram / 512.0).round() as u32 * 512)
-                                        .clamp(1024, 16384);
+                                    self.ram_mb =
+                                        ((ram / RAM_STEP_MB as f32).round() as u32 * RAM_STEP_MB)
+                                            .clamp(MIN_RAM_MB, manual_max);
                                 }
                             });
                             ui.label(

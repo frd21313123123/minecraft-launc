@@ -5,6 +5,7 @@ pub mod error;
 pub mod install;
 pub mod java;
 pub mod launch;
+pub mod memory;
 pub mod mmc;
 pub mod models;
 pub mod neoforge;

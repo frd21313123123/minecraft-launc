@@ -138,7 +138,7 @@ impl Config {
             self.accounts[self.active_account].username = "Player".into();
         }
         self.username = self.accounts[self.active_account].username.clone();
-        self.ram_mb = self.ram_mb.clamp(1024, 16384);
+        self.ram_mb = self.ram_mb.max(1024);
         if self.server_name.trim().is_empty() {
             self.server_name = "МОЯ СБОРКА".into();
         }
