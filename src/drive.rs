@@ -9,6 +9,7 @@
 use std::fs::{self, File};
 use std::io::{copy, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use zip::ZipArchive;
@@ -210,13 +211,14 @@ pub fn install_build(
         );
     }
 
-    download_drive_file(
+    download_drive_file_with_cancel(
         &client,
         &build.file_id,
         &cache_zip,
         Some(&progress),
         &label,
         build.size,
+        Some(cancel),
     )?;
 
     // Drive изредка завершает ответ раньше времени. Если размер ответа нельзя
@@ -225,13 +227,14 @@ pub fn install_build(
         fs::remove_file(&cache_zip)?;
         let retry_label = format!("Повторное скачивание «{}»", build.name);
         progress(0, build.size.unwrap_or(0), &retry_label);
-        download_drive_file(
+        download_drive_file_with_cancel(
             &client,
             &build.file_id,
             &cache_zip,
             Some(&progress),
             &retry_label,
             build.size,
+            Some(cancel),
         )?;
         validate_zip_archive(&cache_zip).map_err(|retry_error| {
             let _ = fs::remove_file(&cache_zip);
@@ -960,6 +963,21 @@ pub fn download_drive_file(
     label: &str,
     known_size: Option<u64>,
 ) -> Result<(), LauncherError> {
+    download_drive_file_with_cancel(client, file_id, dest, progress, label, known_size, None)
+}
+
+fn download_drive_file_with_cancel(
+    client: &reqwest::blocking::Client,
+    file_id: &str,
+    dest: &Path,
+    progress: Option<&ProgressFn>,
+    label: &str,
+    known_size: Option<u64>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), LauncherError> {
+    if is_cancelled(cancel) {
+        return Err(cancelled_error());
+    }
     if dest.exists() {
         let len = dest.metadata().map(|m| m.len()).unwrap_or(0);
         let size_matches = known_size
@@ -1021,6 +1039,7 @@ pub fn download_drive_file(
                 progress,
                 label,
                 known_size.or(size_from_html),
+                cancel,
             );
         }
 
@@ -1041,6 +1060,7 @@ pub fn download_drive_file(
                 progress,
                 label,
                 known_size.or(size_from_html),
+                cancel,
             );
         }
         if html.contains("accounts.google.com") || html.contains("Sign in") {
@@ -1054,7 +1074,7 @@ pub fn download_drive_file(
         ));
     }
 
-    stream_to_file(resp, dest, progress, label, known_size)
+    stream_to_file(resp, dest, progress, label, known_size, cancel)
 }
 
 fn stream_drive_response(
@@ -1063,6 +1083,7 @@ fn stream_drive_response(
     progress: Option<&ProgressFn>,
     label: &str,
     known_size: Option<u64>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), LauncherError> {
     let content_type = resp
         .headers()
@@ -1084,7 +1105,7 @@ fn stream_drive_response(
             "Google Drive повторно вернул веб-страницу вместо архива.".into(),
         ));
     }
-    stream_to_file(resp, dest, progress, label, known_size)
+    stream_to_file(resp, dest, progress, label, known_size, cancel)
 }
 
 fn download_drive_bytes(
@@ -1109,6 +1130,7 @@ fn stream_to_file(
     progress: Option<&ProgressFn>,
     label: &str,
     known_size: Option<u64>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), LauncherError> {
     let header_total = resp.content_length().unwrap_or(0);
     let range_total = resp
@@ -1140,6 +1162,11 @@ fn stream_to_file(
     }
 
     loop {
+        if is_cancelled(cancel) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(cancelled_error());
+        }
         let n = resp
             .read(&mut chunk)
             .map_err(|e| LauncherError::Network(e.to_string()))?;
@@ -1154,6 +1181,11 @@ fn stream_to_file(
                 cb(done, total, label);
             }
         }
+    }
+    if is_cancelled(cancel) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(cancelled_error());
     }
     file.flush()?;
     drop(file);
@@ -1172,6 +1204,14 @@ fn stream_to_file(
     }
     fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+}
+
+fn cancelled_error() -> LauncherError {
+    LauncherError::Other("Отменено".into())
 }
 
 /// `Content-Range: bytes 0-1023/2048` или `bytes */2048`
