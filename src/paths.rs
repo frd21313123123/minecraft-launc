@@ -4,6 +4,13 @@ use std::sync::{OnceLock, RwLock};
 pub const APP_NAME: &str = "MineLauncher";
 pub const LAUNCHER_VERSION: &str = "1.0.0";
 
+/// Каталог, из которого был запущен лаунчер.
+fn launch_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .clone()
+}
+
 pub fn app_dir() -> PathBuf {
     dirs::data_dir()
         .or_else(dirs::home_dir)
@@ -17,7 +24,7 @@ fn builds_root_override() -> &'static RwLock<Option<PathBuf>> {
 }
 
 /// Меняет корень, в котором хранятся архивы и распакованные сборки.
-/// Пустой путь возвращает стандартное расположение внутри каталога приложения.
+/// Пустой путь возвращает стандартное расположение в каталоге запуска.
 pub fn set_builds_root(path: Option<PathBuf>) {
     if let Ok(mut root) = builds_root_override().write() {
         *root = path.filter(|p| !p.as_os_str().is_empty());
@@ -29,7 +36,7 @@ pub fn builds_root() -> PathBuf {
         .read()
         .ok()
         .and_then(|root| root.clone())
-        .unwrap_or_else(app_dir)
+        .unwrap_or_else(launch_dir)
 }
 
 /// Общий runtime-каталог (versions / libraries / assets).
@@ -47,9 +54,7 @@ pub fn config_path() -> PathBuf {
 /// Папка располагается рядом с местом запуска приложения, чтобы владелец
 /// сборки мог просто положить туда PNG/JPG/WebP без поиска AppData.
 pub fn screenshots_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("screenshots")
+    launch_dir().join("screenshots")
 }
 
 pub fn last_launch_log() -> PathBuf {
@@ -132,4 +137,14 @@ pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(instances_dir())?;
     std::fs::create_dir_all(screenshots_dir())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_builds_root_is_launch_directory() {
+        assert_eq!(builds_root(), launch_dir());
+    }
 }
