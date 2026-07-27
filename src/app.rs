@@ -12,7 +12,7 @@ use eframe::egui::{
 
 use mine_launcher::config::{AccountConfig, Config, SkinModel, Theme};
 use mine_launcher::download::ProgressFn;
-use mine_launcher::drive::{self, BuildInfo};
+use mine_launcher::drive::{self, BuildInfo, BuildUpdateStatus};
 use mine_launcher::install::{self, is_version_installed};
 use mine_launcher::java::{ensure_java_for_version, find_java, java_version_string};
 use mine_launcher::memory::{
@@ -30,12 +30,14 @@ use mine_launcher::skin_sync::{self, SkinSyncOutcome};
 enum WorkerMsg {
     BuildsOk(Vec<BuildInfo>),
     BuildsErr(String),
+    BuildRefreshed(BuildInfo),
     Progress {
         done: u64,
         total: u64,
         label: String,
     },
     Status(String),
+    LaunchStarted,
     DoneOk {
         build: String,
         username: String,
@@ -390,7 +392,7 @@ impl MineLauncherApp {
         let java_path = self.config.java_path.clone();
         let tx = self.tx.clone();
         let cancel = self.cancel.clone();
-        let need_download = !drive::is_build_installed(&build.id);
+        let requested_build_id = build.id.clone();
         let skin_account = self
             .config
             .accounts
@@ -402,26 +404,11 @@ impl MineLauncherApp {
             });
         let skin_server_address = self.config.server_address.clone();
 
-        self.busy = if need_download {
-            Busy::Installing
-        } else {
-            Busy::Launching
-        };
-        if need_download {
-            self.status = format!("Установка «{}»…", build.name);
-            self.detail = "Скачиваем файлы сборки".into();
-            if let Some(size) = build.size.filter(|size| *size > 0) {
-                self.progress_indeterminate = false;
-                self.progress_text = format!("0 / {} · 0%", format_bytes(size));
-            } else {
-                self.progress_indeterminate = true;
-                self.progress_text = "Подключение…".into();
-            }
-        } else {
-            self.status = format!("Запуск «{}»…", build.name);
-            self.detail = format!("Профиль: {username}");
-            self.progress_indeterminate = true;
-        }
+        self.busy = Busy::Installing;
+        self.status = format!("Проверка обновления «{}»…", build.name);
+        self.detail = "Получаем актуальные данные с Google Drive".into();
+        self.progress_indeterminate = true;
+        self.progress_text = "Проверка…".into();
         self.append_log(format!("{}: {} ({username})", self.status, build.id));
 
         thread::spawn(move || {
@@ -436,16 +423,81 @@ impl MineLauncherApp {
                 }
             });
 
-            let instance = if need_download {
-                match drive::install_build(&build, progress.clone(), &cancel) {
-                    Ok((path, _)) => path,
-                    Err(error) => {
-                        let _ = tx.send(WorkerMsg::DoneErr(error.to_string()));
-                        return;
+            let builds = match drive::fetch_builds() {
+                Ok(builds) => builds,
+                Err(error) => {
+                    let _ = tx.send(WorkerMsg::DoneErr(format!(
+                        "Не удалось проверить обновление сборки: {error}"
+                    )));
+                    return;
+                }
+            };
+            let Some(build) = builds
+                .into_iter()
+                .find(|build| build.id == requested_build_id)
+            else {
+                let _ = tx.send(WorkerMsg::DoneErr(format!(
+                    "Сборка с id «{requested_build_id}» больше не найдена в каталоге Google Drive"
+                )));
+                return;
+            };
+            let _ = tx.send(WorkerMsg::BuildRefreshed(build.clone()));
+
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(WorkerMsg::DoneErr("Отменено".into()));
+                return;
+            }
+
+            let update_status = match drive::build_update_status(&build) {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = tx.send(WorkerMsg::DoneErr(format!(
+                        "Не удалось достоверно проверить обновление: {error}"
+                    )));
+                    return;
+                }
+            };
+
+            let instance = match update_status {
+                BuildUpdateStatus::Current => {
+                    let _ = tx.send(WorkerMsg::Status(format!(
+                        "Сборка «{}» актуальна",
+                        build.name
+                    )));
+                    drive::instance_dir(&build.id)
+                }
+                BuildUpdateStatus::NotInstalled => {
+                    let _ = tx.send(WorkerMsg::Status(format!(
+                        "Установка сборки «{}»…",
+                        build.name
+                    )));
+                    match drive::install_build(&build, progress.clone(), &cancel) {
+                        Ok((path, _)) => path,
+                        Err(error) => {
+                            let _ = tx.send(WorkerMsg::DoneErr(error.to_string()));
+                            return;
+                        }
                     }
                 }
-            } else {
-                drive::instance_dir(&build.id)
+                BuildUpdateStatus::UpdateRequired => {
+                    let _ = tx.send(WorkerMsg::Status(format!(
+                        "Найдено обновление сборки «{}»",
+                        build.name
+                    )));
+                    match drive::install_build(&build, progress.clone(), &cancel) {
+                        Ok((path, _)) => {
+                            let _ = tx.send(WorkerMsg::Status(format!(
+                                "Обновление сборки «{}» установлено",
+                                build.name
+                            )));
+                            path
+                        }
+                        Err(error) => {
+                            let _ = tx.send(WorkerMsg::DoneErr(error.to_string()));
+                            return;
+                        }
+                    }
+                }
             };
 
             let root = drive::resolve_instance_root(&instance);
@@ -560,6 +612,11 @@ impl MineLauncherApp {
                 };
 
                 let _ = tx.send(WorkerMsg::Status(format!("Запуск «{}»…", pack.name)));
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(WorkerMsg::DoneErr("Отменено".into()));
+                    return;
+                }
+                let _ = tx.send(WorkerMsg::LaunchStarted);
                 match launch_game_in_dir(&launch_id, &username, ram, &java, &game) {
                     Ok(_) => {
                         let _ = tx.send(WorkerMsg::DoneOk {
@@ -628,6 +685,11 @@ impl MineLauncherApp {
             }
 
             let _ = tx.send(WorkerMsg::Status(format!("Запуск «{}»…", build.name)));
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(WorkerMsg::DoneErr("Отменено".into()));
+                return;
+            }
+            let _ = tx.send(WorkerMsg::LaunchStarted);
             let skin_sync = if skin_account.skin_source.trim().is_empty() {
                 None
             } else {
@@ -655,9 +717,9 @@ impl MineLauncherApp {
         if self.busy != Busy::Installing || self.cancel.swap(true, Ordering::Relaxed) {
             return;
         }
-        self.status = "Останавливаем загрузку…".into();
+        self.status = "Останавливаем операцию…".into();
         self.detail = "Завершаем текущую операцию".into();
-        self.append_log("Пользователь остановил загрузку сборки");
+        self.append_log("Пользователь остановил проверку или обновление сборки");
     }
 
     fn refresh_java_label(&mut self) {
@@ -699,6 +761,15 @@ impl MineLauncherApp {
                     self.detail = error.clone();
                     self.append_log(format!("Ошибка каталога: {error}"));
                 }
+                WorkerMsg::BuildRefreshed(build) => {
+                    if let Some(current) = self
+                        .builds
+                        .iter_mut()
+                        .find(|current| current.id == build.id)
+                    {
+                        *current = build;
+                    }
+                }
                 WorkerMsg::Progress { done, total, label } => {
                     if self.cancel.load(Ordering::Relaxed) {
                         continue;
@@ -728,6 +799,11 @@ impl MineLauncherApp {
                     self.detail = "Операция выполняется…".into();
                     self.progress_indeterminate = true;
                     self.append_log(status);
+                }
+                WorkerMsg::LaunchStarted => {
+                    self.busy = Busy::Launching;
+                    self.progress_indeterminate = true;
+                    self.progress_text.clear();
                 }
                 WorkerMsg::DoneOk {
                     build,

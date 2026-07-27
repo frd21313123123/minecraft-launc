@@ -10,8 +10,9 @@ use std::fs::{self, File};
 use std::io::{copy, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use crate::download::{self, ProgressFn};
@@ -23,6 +24,8 @@ use crate::paths::{
 
 /// Папка со сборками на Google Drive.
 pub const DRIVE_FOLDER_ID: &str = "1mEl5hfZqx5IUiS_gULZBz4v116YuHYtq";
+const INSTALL_STATE_FILE: &str = ".minelauncher-state.json";
+const INSTALL_STATE_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct BuildInfo {
@@ -34,8 +37,61 @@ pub struct BuildInfo {
     pub file_id: String,
     pub filename: String,
     pub size: Option<u64>,
+    /// Время последнего изменения файла на Drive (Unix time в миллисекундах).
+    pub modified_time_ms: Option<u64>,
     /// Базовая версия Minecraft из builds.json (если указана).
     pub minecraft: Option<String>,
+}
+
+impl BuildInfo {
+    /// Стабильный идентификатор конкретной опубликованной ревизии архива.
+    pub fn revision_id(&self) -> Result<String, LauncherError> {
+        let modified_time_ms = self.modified_time_ms.ok_or_else(|| {
+            LauncherError::Other(format!(
+                "Google Drive не отдал время изменения сборки «{}». \
+                 Без него нельзя безопасно проверить обновление.",
+                self.name
+            ))
+        })?;
+        let size = self.size.filter(|size| *size > 0).ok_or_else(|| {
+            LauncherError::Other(format!(
+                "Google Drive не отдал размер сборки «{}». \
+                 Без него нельзя безопасно проверить обновление.",
+                self.name
+            ))
+        })?;
+        Ok(format!("{}:{modified_time_ms}:{size}", self.file_id))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildUpdateStatus {
+    NotInstalled,
+    Current,
+    UpdateRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InstalledBuildState {
+    schema_version: u32,
+    build_id: String,
+    drive_file_id: String,
+    drive_modified_time_ms: u64,
+    archive_size: u64,
+}
+
+impl InstalledBuildState {
+    fn from_build(build: &BuildInfo) -> Result<Self, LauncherError> {
+        // Проверяем весь набор обязательных полей в одном месте.
+        let _ = build.revision_id()?;
+        Ok(Self {
+            schema_version: INSTALL_STATE_SCHEMA,
+            build_id: sanitize_build_id(&build.id),
+            drive_file_id: build.file_id.clone(),
+            drive_modified_time_ms: build.modified_time_ms.unwrap_or_default(),
+            archive_size: build.size.unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +130,7 @@ struct DriveFile {
     name: String,
     mime: String,
     size: Option<u64>,
+    modified_time_ms: Option<u64>,
 }
 
 pub fn folder_url() -> String {
@@ -96,15 +153,8 @@ pub fn fetch_builds() -> Result<Vec<BuildInfo>, LauncherError> {
     {
         match fetch_builds_manifest(&client, &manifest_file.id) {
             Ok(mut builds) => {
-                // Подтянуть file_id по filename, если не указан.
-                for b in &mut builds {
-                    if b.file_id.is_empty() {
-                        if let Some(f) = files.iter().find(|f| f.name == b.filename) {
-                            b.file_id = f.id.clone();
-                            b.size = f.size.or(b.size);
-                        }
-                    }
-                }
+                // Подтянуть file_id и актуальные метаданные из самой папки Drive.
+                enrich_manifest_builds(&mut builds, &files);
                 builds.retain(|b| !b.file_id.is_empty());
                 builds.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                 return Ok(builds);
@@ -133,6 +183,7 @@ pub fn fetch_builds() -> Result<Vec<BuildInfo>, LauncherError> {
                 file_id: f.id,
                 filename: f.name,
                 size: f.size,
+                modified_time_ms: f.modified_time_ms,
                 minecraft: None,
             }
         })
@@ -140,6 +191,23 @@ pub fn fetch_builds() -> Result<Vec<BuildInfo>, LauncherError> {
 
     builds.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(builds)
+}
+
+fn enrich_manifest_builds(builds: &mut [BuildInfo], files: &[DriveFile]) {
+    for build in builds {
+        let file = if build.file_id.is_empty() {
+            files.iter().find(|file| file.name == build.filename)
+        } else {
+            files.iter().find(|file| file.id == build.file_id)
+        };
+        if let Some(file) = file {
+            if build.file_id.is_empty() {
+                build.file_id = file.id.clone();
+            }
+            build.size = file.size.or(build.size);
+            build.modified_time_ms = file.modified_time_ms;
+        }
+    }
 }
 
 fn fetch_builds_manifest(
@@ -172,6 +240,7 @@ fn fetch_builds_manifest(
                 file_id: b.file_id,
                 filename,
                 size: b.size,
+                modified_time_ms: None,
                 minecraft: b.minecraft,
             }
         })
@@ -187,88 +256,207 @@ pub fn install_build(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(PathBuf, Option<BuildMeta>), LauncherError> {
     ensure_dirs()?;
+    let install_state = InstalledBuildState::from_build(build)?;
     let client = download::http_client()?;
     let build_id = sanitize_build_id(&build.id);
-
+    let operation_id = operation_id();
     let cache_zip = builds_dir().join(&build.filename);
+    let candidate_zip = builds_dir().join(format!(".{build_id}-{operation_id}.download.zip"));
+    let dest = paths_instance_dir(&build_id);
+    let instances_parent = dest
+        .parent()
+        .ok_or_else(|| LauncherError::Other("Некорректный путь инстанса".into()))?;
+    let staging = instances_parent.join(format!(".{build_id}-update-{operation_id}"));
+    let backup = instances_parent.join(format!(".{build_id}-backup-{operation_id}"));
     let label = format!("Скачивание «{}»", build.name);
-    // 0/total с known size — чтобы UI сразу показал 0% и размер.
-    if let Some(sz) = build.size.filter(|&s| s > 0) {
-        progress(0, sz, &label);
-    } else {
-        progress(0, 0, &label);
-    }
+    progress(0, build.size.unwrap_or(0), &label);
 
-    // Не доверяем кэшу только потому, что файл ненулевого размера: прерванная
-    // загрузка тоже оставляет ненулевой файл, но у него нет ZIP central directory.
-    if cache_zip.exists() && validate_zip_archive(&cache_zip).is_err() {
-        fs::remove_file(&cache_zip)?;
-        let _ = fs::remove_file(cache_zip.with_extension("part"));
-        progress(
-            0,
-            build.size.unwrap_or(0),
-            "Повреждённый кэш удалён, скачиваем заново…",
-        );
-    }
+    let result = (|| {
+        let _ = fs::remove_file(&candidate_zip);
+        let _ = fs::remove_file(candidate_zip.with_extension("part"));
+        download_and_validate_build_archive(&client, build, &candidate_zip, &progress, cancel)?;
 
+        let installed = install_archive_atomically(
+            build,
+            install_state,
+            &candidate_zip,
+            &dest,
+            &staging,
+            &backup,
+            &progress,
+            cancel,
+        )?;
+
+        // Кэш не участвует в принятии решения об обновлении. Сохраняем в нём
+        // только уже проверенный архив новой ревизии.
+        if cache_zip != candidate_zip {
+            if cache_zip.exists() {
+                let _ = fs::remove_file(&cache_zip);
+            }
+            if let Err(error) = fs::rename(&candidate_zip, &cache_zip) {
+                eprintln!("Не удалось обновить кэш сборки: {error}");
+            }
+        }
+
+        Ok(installed)
+    })();
+
+    let _ = fs::remove_file(&candidate_zip);
+    let _ = fs::remove_file(candidate_zip.with_extension("part"));
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+        if backup.exists() && !dest.exists() {
+            let _ = fs::rename(&backup, &dest);
+        }
+    }
+    result
+}
+
+fn download_and_validate_build_archive(
+    client: &reqwest::blocking::Client,
+    build: &BuildInfo,
+    destination: &Path,
+    progress: &ProgressFn,
+    cancel: &AtomicBool,
+) -> Result<(), LauncherError> {
+    let label = format!("Скачивание обновления «{}»", build.name);
     download_drive_file_with_cancel(
-        &client,
+        client,
         &build.file_id,
-        &cache_zip,
-        Some(&progress),
+        destination,
+        Some(progress),
         &label,
         build.size,
         Some(cancel),
     )?;
 
-    // Drive изредка завершает ответ раньше времени. Если размер ответа нельзя
-    // было проверить по HTTP-заголовкам, ZIP-проверка поймает это здесь.
-    if let Err(first_error) = validate_zip_archive(&cache_zip) {
-        fs::remove_file(&cache_zip)?;
+    if let Err(first_error) = validate_zip_archive(destination) {
+        let _ = fs::remove_file(destination);
+        let _ = fs::remove_file(destination.with_extension("part"));
         let retry_label = format!("Повторное скачивание «{}»", build.name);
         progress(0, build.size.unwrap_or(0), &retry_label);
         download_drive_file_with_cancel(
-            &client,
+            client,
             &build.file_id,
-            &cache_zip,
-            Some(&progress),
+            destination,
+            Some(progress),
             &retry_label,
             build.size,
             Some(cancel),
         )?;
-        validate_zip_archive(&cache_zip).map_err(|retry_error| {
-            let _ = fs::remove_file(&cache_zip);
+        validate_zip_archive(destination).map_err(|retry_error| {
             LauncherError::Other(format!(
                 "Архив сборки повреждён даже после повторной загрузки \
                  ({first_error}; повторно: {retry_error}). Проверьте соединение и свободное место."
             ))
         })?;
     }
+    Ok(())
+}
 
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(LauncherError::Other("Отменено".into()));
+#[allow(clippy::too_many_arguments)]
+fn install_archive_atomically(
+    build: &BuildInfo,
+    install_state: InstalledBuildState,
+    archive: &Path,
+    destination: &Path,
+    staging: &Path,
+    backup: &Path,
+    progress: &ProgressFn,
+    cancel: &AtomicBool,
+) -> Result<(PathBuf, Option<BuildMeta>), LauncherError> {
+    validate_zip_archive(archive)?;
+    let was_update = destination.exists();
+    if cancel.load(Ordering::Relaxed) {
+        return Err(cancelled_error());
     }
 
-    progress(0, 0, "Распаковка сборки…");
-    let dest = paths_instance_dir(&build_id);
+    let _ = fs::remove_dir_all(staging);
+    let _ = fs::remove_dir_all(backup);
+    fs::create_dir_all(staging)?;
+    progress(0, 0, "Распаковка обновления…");
 
-    // Сохраняем пользовательские данные (миры, настройки) перед переустановкой.
-    let preserved = stash_user_data(&dest)?;
+    let prepared = (|| {
+        extract_zip(archive, staging)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled_error());
+        }
 
-    if dest.exists() {
-        fs::remove_dir_all(&dest)?;
+        let root = resolve_instance_root(staging);
+        let game = ensure_isolated_game_dir(&root)?;
+        copy_user_data_from_instance(destination, &game)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled_error());
+        }
+
+        write_install_state(staging, &install_state)?;
+        let meta = read_build_meta(staging);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled_error());
+        }
+        replace_instance_atomically(destination, staging, backup)?;
+        Ok(meta)
+    })();
+
+    match prepared {
+        Ok(meta) => {
+            let action = if was_update {
+                "обновлена"
+            } else {
+                "установлена"
+            };
+            progress(1, 1, &format!("Сборка «{}» {action}", build.name));
+            Ok((destination.to_path_buf(), meta))
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(staging);
+            Err(error)
+        }
     }
-    fs::create_dir_all(&dest)?;
-    extract_zip(&cache_zip, &dest)?;
+}
 
-    // Гарантируем изолированный game dir: instances/{id}/minecraft
-    let root = resolve_instance_root(&dest);
-    let game = ensure_isolated_game_dir(&root)?;
-    restore_user_data(&game, preserved)?;
+fn replace_instance_atomically(
+    destination: &Path,
+    staging: &Path,
+    backup: &Path,
+) -> Result<(), LauncherError> {
+    let had_existing = destination.exists();
+    if had_existing {
+        fs::rename(destination, backup)?;
+    }
 
-    let meta = read_build_meta(&dest);
-    progress(1, 1, &format!("Сборка «{}» готова", build.name));
-    Ok((dest, meta))
+    if let Err(error) = fs::rename(staging, destination) {
+        if had_existing {
+            if let Err(rollback_error) = fs::rename(backup, destination) {
+                return Err(LauncherError::Other(format!(
+                    "Не удалось применить обновление ({error}) и восстановить старую сборку \
+                     ({rollback_error}). Резервная копия: {}",
+                    backup.display()
+                )));
+            }
+        }
+        return Err(LauncherError::Other(format!(
+            "Не удалось применить обновление сборки: {error}"
+        )));
+    }
+
+    if had_existing {
+        if let Err(error) = fs::remove_dir_all(backup) {
+            eprintln!(
+                "Обновление установлено, но не удалось удалить резервную копию {}: {error}",
+                backup.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn operation_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
 }
 
 pub fn instance_dir(build_id: &str) -> PathBuf {
@@ -367,93 +555,47 @@ const USER_DATA_ENTRIES: &[&str] = &[
     "realms_persistence.json",
 ];
 
-struct StashedUserData {
-    tmp: PathBuf,
-}
-
-fn stash_user_data(instance: &Path) -> Result<Option<StashedUserData>, LauncherError> {
+fn copy_user_data_from_instance(instance: &Path, new_game: &Path) -> Result<(), LauncherError> {
     if !instance.is_dir() {
-        return Ok(None);
+        return Ok(());
     }
     let root = resolve_instance_root(instance);
-    let game = resolve_game_dir_for_root(&root);
-    if !game.is_dir() {
-        return Ok(None);
+    let old_game = resolve_game_dir_for_root(&root);
+    if !old_game.is_dir() {
+        return Ok(());
     }
 
-    let tmp = instance
-        .parent()
-        .unwrap_or(instance)
-        .join(format!(".userdata-{}", sanitize_build_id(
-            instance
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("build"),
-        )));
-    if tmp.exists() {
-        let _ = fs::remove_dir_all(&tmp);
-    }
-    fs::create_dir_all(&tmp)?;
-
-    let mut any = false;
     for name in USER_DATA_ENTRIES {
-        let src = game.join(name);
+        let src = old_game.join(name);
         if !src.exists() {
             continue;
         }
-        let dst = tmp.join(name);
+        let dst = new_game.join(name);
+        // Миры и пользовательские настройки важнее значений по умолчанию
+        // из нового архива. Остальные файлы сохраняем, только если пак их не принёс.
+        let prefer_user = *name == "saves"
+            || *name == "screenshots"
+            || name.starts_with("options")
+            || name.starts_with("servers");
+        if dst.exists() && !prefer_user {
+            continue;
+        }
+        if dst.exists() {
+            if dst.is_dir() {
+                fs::remove_dir_all(&dst)?;
+            } else {
+                fs::remove_file(&dst)?;
+            }
+        }
         if src.is_dir() {
             copy_dir_all(&src, &dst)?;
         } else {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(&src, &dst)?;
         }
-        any = true;
     }
-
-    if any {
-        Ok(Some(StashedUserData { tmp }))
-    } else {
-        let _ = fs::remove_dir_all(&tmp);
-        Ok(None)
-    }
-}
-
-fn restore_user_data(game: &Path, stashed: Option<StashedUserData>) -> Result<(), LauncherError> {
-    let Some(stash) = stashed else {
-        return Ok(());
-    };
-    fs::create_dir_all(game)?;
-    if let Ok(entries) = fs::read_dir(&stash.tmp) {
-        for e in entries.flatten() {
-            let src = e.path();
-            let dst = game.join(e.file_name());
-            // Не затираем файлы из новой сборки, если уже есть (кроме saves — миры важнее).
-            let name = e.file_name().to_string_lossy().to_string();
-            let prefer_user = name == "saves"
-                || name == "screenshots"
-                || name.starts_with("options")
-                || name.starts_with("servers");
-            if dst.exists() && !prefer_user {
-                continue;
-            }
-            if dst.exists() && prefer_user {
-                let _ = if dst.is_dir() {
-                    fs::remove_dir_all(&dst)
-                } else {
-                    fs::remove_file(&dst)
-                };
-            }
-            if src.is_dir() {
-                copy_dir_all(&src, &dst)?;
-            } else {
-                if let Some(p) = dst.parent() {
-                    fs::create_dir_all(p)?;
-                }
-                fs::copy(&src, &dst)?;
-            }
-        }
-    }
-    let _ = fs::remove_dir_all(&stash.tmp);
     Ok(())
 }
 
@@ -476,17 +618,68 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), LauncherError> {
 }
 
 pub fn is_build_installed(build_id: &str) -> bool {
-    let dir = instance_dir(build_id);
+    is_build_installed_at(&instance_dir(build_id))
+}
+
+fn is_build_installed_at(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    let root = resolve_instance_root(&dir);
+    let root = resolve_instance_root(dir);
     // Считаем установленной только если есть признаки реальной сборки.
     root.join("mmc-pack.json").is_file()
         || root.join("mods").is_dir()
         || root.join("minecraft").join("mods").is_dir()
         || root.join("build.json").is_file()
         || root.join("pack.json").is_file()
+}
+
+pub fn build_update_status(build: &BuildInfo) -> Result<BuildUpdateStatus, LauncherError> {
+    build_update_status_at(build, &instance_dir(&build.id))
+}
+
+fn build_update_status_at(
+    build: &BuildInfo,
+    instance: &Path,
+) -> Result<BuildUpdateStatus, LauncherError> {
+    let expected = InstalledBuildState::from_build(build)?;
+    if !is_build_installed_at(instance) {
+        return Ok(BuildUpdateStatus::NotInstalled);
+    }
+
+    let state = read_install_state(instance);
+    if state.as_ref() == Some(&expected) {
+        Ok(BuildUpdateStatus::Current)
+    } else {
+        // Старые установки и повреждённые state-файлы обновляются один раз.
+        Ok(BuildUpdateStatus::UpdateRequired)
+    }
+}
+
+fn install_state_path(instance: &Path) -> PathBuf {
+    instance.join(INSTALL_STATE_FILE)
+}
+
+fn read_install_state(instance: &Path) -> Option<InstalledBuildState> {
+    let data = fs::read(install_state_path(instance)).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn write_install_state(instance: &Path, state: &InstalledBuildState) -> Result<(), LauncherError> {
+    fs::create_dir_all(instance)?;
+    let destination = install_state_path(instance);
+    let temporary = instance.join(format!("{INSTALL_STATE_FILE}.part"));
+    let data = serde_json::to_vec_pretty(state)
+        .map_err(|error| LauncherError::Parse(format!("state сборки: {error}")))?;
+    let mut file = File::create(&temporary)?;
+    file.write_all(&data)?;
+    file.flush()?;
+    drop(file);
+    if destination.exists() {
+        fs::remove_file(&destination)?;
+    }
+    fs::rename(&temporary, &destination)?;
+    Ok(())
 }
 
 pub fn read_build_meta(instance: &Path) -> Option<BuildMeta> {
@@ -555,6 +748,8 @@ fn list_folder_files(
     let url = format!("https://drive.google.com/drive/folders/{folder_id}?usp=sharing");
     let html = client
         .get(&url)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+        .header(reqwest::header::PRAGMA, "no-cache")
         .header(
             reqwest::header::ACCEPT_LANGUAGE,
             "en-US,en;q=0.9,ru;q=0.8",
@@ -606,6 +801,7 @@ fn parse_drive_html(html: &str) -> Vec<DriveFile> {
                         name: decode_js_string(&name),
                         mime,
                         size: None,
+                        modified_time_ms: None,
                     });
                 }
             }
@@ -629,6 +825,7 @@ fn parse_drive_html(html: &str) -> Vec<DriveFile> {
                         name,
                         mime: String::new(),
                         size: None,
+                        modified_time_ms: None,
                     });
                 }
             }
@@ -652,6 +849,7 @@ fn parse_drive_html(html: &str) -> Vec<DriveFile> {
                         name,
                         mime: String::new(),
                         size: None,
+                        modified_time_ms: None,
                     });
                 }
             }
@@ -675,6 +873,7 @@ fn parse_drive_html(html: &str) -> Vec<DriveFile> {
                         name,
                         mime: String::new(),
                         size: None,
+                        modified_time_ms: None,
                     });
                 }
             }
@@ -708,13 +907,14 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
     let encoded = &body[..end];
     let decoded = decode_js_hex_escapes(encoded);
 
-    // ["FILE_ID",["FOLDER_ID"],"name.ext","mime/type",...,null,null,SIZE
-    // id 25–44 символа; SIZE часто идёт после двух null (метаданные Drive).
+    // ["FILE_ID",["FOLDER_ID"],"name.ext","mime/type",...,MODIFIED,CREATED,null,null,SIZE
+    // id 25–44 символа; Drive отдаёт timestamps в миллисекундах.
     let Ok(re) = regex_lite::Regex::new(
-        r#"\["([a-zA-Z0-9_-]{25,44})",\["([a-zA-Z0-9_-]{25,44})"\],"([^"]+\.(?:zip|json|jar|txt|mrpack))","([^"]*)"(?:[^\]]{0,120}?null,null,(\d{3,}))?"#,
+        r#"\["([a-zA-Z0-9_-]{25,44})",\["([a-zA-Z0-9_-]{25,44})"\],"([^"]+\.(?:zip|json|jar|txt|mrpack))","([^"]*)"([^\]]{0,240})"#,
     ) else {
         return files;
     };
+    let metadata_re = regex_lite::Regex::new(r#",(\d{10,16}),(\d{10,16}),null,null,(\d{1,})"#).ok();
 
     for cap in re.captures_iter(&decoded) {
         let id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
@@ -724,10 +924,20 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
             .get(4)
             .map(|m| m.as_str().replace("\\/", "/"))
             .unwrap_or_default();
-        let size = cap
-            .get(5)
-            .and_then(|m| m.as_str().parse::<u64>().ok())
-            .filter(|&s| s > 0);
+        let metadata = cap.get(5).map(|m| m.as_str()).unwrap_or("");
+        let metadata = metadata_re
+            .as_ref()
+            .and_then(|metadata_re| metadata_re.captures(metadata));
+        let modified_time_ms = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(1))
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+            .map(normalize_drive_timestamp);
+        let size = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(3))
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+            .filter(|&size| size > 0);
         if id.is_empty() || id == DRIVE_FOLDER_ID || name.is_empty() {
             continue;
         }
@@ -738,6 +948,7 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
             name: decode_js_string(&name),
             mime,
             size,
+            modified_time_ms,
         });
     }
 
@@ -755,6 +966,7 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
                         name: decode_js_string(&name),
                         mime: String::new(),
                         size: None,
+                        modified_time_ms: None,
                     });
                 }
             }
@@ -762,6 +974,14 @@ fn parse_drive_ivd(html: &str) -> Vec<DriveFile> {
     }
 
     files
+}
+
+fn normalize_drive_timestamp(value: u64) -> u64 {
+    if value < 100_000_000_000 {
+        value.saturating_mul(1_000)
+    } else {
+        value
+    }
 }
 
 fn parse_embedded_folder(html: &str) -> Vec<DriveFile> {
@@ -785,6 +1005,7 @@ fn parse_embedded_folder(html: &str) -> Vec<DriveFile> {
                     name,
                     mime: String::new(),
                     size: None,
+                    modified_time_ms: None,
                 });
             }
         }
@@ -807,6 +1028,7 @@ fn parse_embedded_folder(html: &str) -> Vec<DriveFile> {
                         name,
                         mime: String::new(),
                         size: None,
+                        modified_time_ms: None,
                     });
                 }
             }
@@ -830,6 +1052,7 @@ fn parse_embedded_folder(html: &str) -> Vec<DriveFile> {
                         name,
                         mime: String::new(),
                         size: None,
+                        modified_time_ms: None,
                     });
                 }
             }
@@ -1004,6 +1227,8 @@ fn download_drive_file_with_cancel(
     let url = direct_download_url(file_id);
     let resp = client
         .get(&url)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+        .header(reqwest::header::PRAGMA, "no-cache")
         .send()
         .map_err(|e| LauncherError::Network(e.to_string()))?
         .error_for_status()
@@ -1118,6 +1343,10 @@ fn download_drive_bytes(
     let tmp_dir = builds_dir().join(".tmp");
     fs::create_dir_all(&tmp_dir)?;
     let tmp = tmp_dir.join(format!("{file_id}.bin"));
+    // После аварийного завершения здесь мог остаться старый builds.json.
+    // Каталог перед запуском всегда должен читаться заново.
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("part"));
     download_drive_file(client, file_id, &tmp, progress, label, None)?;
     let bytes = fs::read(&tmp)?;
     let _ = fs::remove_file(&tmp);
@@ -1397,6 +1626,50 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), LauncherError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mine-launcher-{label}-{}", operation_id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn sample_build(modified_time_ms: u64, size: u64) -> BuildInfo {
+        BuildInfo {
+            id: "stable-pack".into(),
+            name: "Stable Pack".into(),
+            file_id: "1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj".into(),
+            filename: "stable-pack.zip".into(),
+            size: Some(size),
+            modified_time_ms: Some(modified_time_ms),
+            minecraft: Some("1.21.1".into()),
+        }
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap();
+    }
 
     #[test]
     fn parse_drive_ivd_modern_payload() {
@@ -1409,6 +1682,237 @@ mod tests {
         assert_eq!(files[0].name, "createA2.zip");
         assert!(files[0].mime.contains("zip"));
         assert_eq!(files[0].size, Some(459433190));
+        assert_eq!(files[0].modified_time_ms, Some(1784988932123));
+    }
+
+    #[test]
+    fn manifest_build_is_enriched_even_when_file_id_is_already_set() {
+        let mut builds = vec![BuildInfo {
+            id: "stable-pack".into(),
+            name: "Stable Pack".into(),
+            file_id: "1AVVO2ENG0WYFduO_1TbEi4L20rPs7eXj".into(),
+            filename: "stable-pack.zip".into(),
+            size: Some(10),
+            modified_time_ms: None,
+            minecraft: None,
+        }];
+        let files = vec![DriveFile {
+            id: builds[0].file_id.clone(),
+            name: builds[0].filename.clone(),
+            mime: "application/zip".into(),
+            size: Some(500),
+            modified_time_ms: Some(1784988932123),
+        }];
+
+        enrich_manifest_builds(&mut builds, &files);
+
+        assert_eq!(builds[0].size, Some(500));
+        assert_eq!(builds[0].modified_time_ms, Some(1784988932123));
+    }
+
+    #[test]
+    fn update_status_uses_drive_revision_and_legacy_install_requires_update() {
+        let temp = TestDirectory::new("revision");
+        let instance = temp.path.join("instance");
+        fs::create_dir_all(instance.join("minecraft").join("mods")).unwrap();
+        let build = sample_build(1784988932123, 500);
+
+        assert_eq!(
+            build_update_status_at(&build, &instance).unwrap(),
+            BuildUpdateStatus::UpdateRequired
+        );
+
+        let state = InstalledBuildState::from_build(&build).unwrap();
+        write_install_state(&instance, &state).unwrap();
+        assert_eq!(
+            build_update_status_at(&build, &instance).unwrap(),
+            BuildUpdateStatus::Current
+        );
+
+        let changed_time = sample_build(1784988932124, 500);
+        assert_eq!(
+            build_update_status_at(&changed_time, &instance).unwrap(),
+            BuildUpdateStatus::UpdateRequired
+        );
+
+        let changed_file = BuildInfo {
+            file_id: "1NEWFILEID000000000000000000000000".into(),
+            ..build.clone()
+        };
+        assert_eq!(
+            build_update_status_at(&changed_file, &instance).unwrap(),
+            BuildUpdateStatus::UpdateRequired
+        );
+    }
+
+    #[test]
+    fn missing_required_drive_metadata_blocks_update_check() {
+        let temp = TestDirectory::new("missing-metadata");
+        let instance = temp.path.join("instance");
+        let build = BuildInfo {
+            modified_time_ms: None,
+            ..sample_build(1784988932123, 500)
+        };
+
+        let error = build_update_status_at(&build, &instance)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("время изменения"));
+    }
+
+    #[test]
+    fn atomic_update_replaces_pack_files_and_preserves_user_data() {
+        let temp = TestDirectory::new("atomic-update");
+        let destination = temp.path.join("stable-pack");
+        let staging = temp.path.join(".stable-pack-update");
+        let backup = temp.path.join(".stable-pack-backup");
+        let archive = temp.path.join("update.zip");
+
+        fs::create_dir_all(destination.join("minecraft").join("mods")).unwrap();
+        fs::create_dir_all(destination.join("minecraft").join("config")).unwrap();
+        fs::create_dir_all(destination.join("minecraft").join("saves").join("my-world")).unwrap();
+        fs::write(
+            destination.join("minecraft").join("mods").join("old.jar"),
+            b"old mod",
+        )
+        .unwrap();
+        fs::write(
+            destination
+                .join("minecraft")
+                .join("config")
+                .join("local.cfg"),
+            b"old config",
+        )
+        .unwrap();
+        fs::write(
+            destination
+                .join("minecraft")
+                .join("saves")
+                .join("my-world")
+                .join("level.dat"),
+            b"my world",
+        )
+        .unwrap();
+        fs::write(
+            destination.join("minecraft").join("options.txt"),
+            b"user options",
+        )
+        .unwrap();
+
+        write_test_zip(
+            &archive,
+            &[
+                ("minecraft/mods/new.jar", b"new mod"),
+                ("minecraft/config/pack.cfg", b"new config"),
+                ("minecraft/saves/example/level.dat", b"example world"),
+                ("minecraft/options.txt", b"pack options"),
+            ],
+        );
+        let build = sample_build(1784988932124, fs::metadata(&archive).unwrap().len());
+        let state = InstalledBuildState::from_build(&build).unwrap();
+        let progress: ProgressFn = Arc::new(|_, _, _| {});
+        let cancel = AtomicBool::new(false);
+
+        install_archive_atomically(
+            &build,
+            state,
+            &archive,
+            &destination,
+            &staging,
+            &backup,
+            &progress,
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(!destination
+            .join("minecraft")
+            .join("mods")
+            .join("old.jar")
+            .exists());
+        assert!(destination
+            .join("minecraft")
+            .join("mods")
+            .join("new.jar")
+            .is_file());
+        assert!(!destination
+            .join("minecraft")
+            .join("config")
+            .join("local.cfg")
+            .exists());
+        assert!(destination
+            .join("minecraft")
+            .join("config")
+            .join("pack.cfg")
+            .is_file());
+        assert_eq!(
+            fs::read(
+                destination
+                    .join("minecraft")
+                    .join("saves")
+                    .join("my-world")
+                    .join("level.dat")
+            )
+            .unwrap(),
+            b"my world"
+        );
+        assert_eq!(
+            fs::read(destination.join("minecraft").join("options.txt")).unwrap(),
+            b"user options"
+        );
+        assert_eq!(
+            build_update_status_at(&build, &destination).unwrap(),
+            BuildUpdateStatus::Current
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn invalid_archive_or_cancellation_keeps_existing_instance() {
+        let temp = TestDirectory::new("atomic-failure");
+        let destination = temp.path.join("stable-pack");
+        let staging = temp.path.join(".stable-pack-update");
+        let backup = temp.path.join(".stable-pack-backup");
+        let archive = temp.path.join("broken.zip");
+        fs::create_dir_all(destination.join("minecraft").join("mods")).unwrap();
+        let old_mod = destination.join("minecraft").join("mods").join("old.jar");
+        fs::write(&old_mod, b"old mod").unwrap();
+        fs::write(&archive, b"not a zip").unwrap();
+
+        let build = sample_build(1784988932124, 9);
+        let state = InstalledBuildState::from_build(&build).unwrap();
+        let progress: ProgressFn = Arc::new(|_, _, _| {});
+        let cancel = AtomicBool::new(false);
+        assert!(install_archive_atomically(
+            &build,
+            state.clone(),
+            &archive,
+            &destination,
+            &staging,
+            &backup,
+            &progress,
+            &cancel,
+        )
+        .is_err());
+        assert_eq!(fs::read(&old_mod).unwrap(), b"old mod");
+
+        let valid_archive = temp.path.join("valid.zip");
+        write_test_zip(&valid_archive, &[("minecraft/mods/new.jar", b"new mod")]);
+        let cancelled = AtomicBool::new(true);
+        assert!(install_archive_atomically(
+            &build,
+            state,
+            &valid_archive,
+            &destination,
+            &staging,
+            &backup,
+            &progress,
+            &cancelled,
+        )
+        .is_err());
+        assert_eq!(fs::read(&old_mod).unwrap(), b"old mod");
+        assert!(!staging.exists());
+        assert!(!backup.exists());
     }
 
     #[test]
