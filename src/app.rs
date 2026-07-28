@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -44,6 +45,10 @@ enum WorkerMsg {
         skin_sync: Option<Result<SkinSyncOutcome, String>>,
     },
     DoneErr(String),
+    SkinPreviewLoaded {
+        source: String,
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +97,8 @@ pub struct MineLauncherApp {
     ram_mb: u32,
     total_ram_mb: Option<u32>,
     steve_texture: egui::TextureHandle,
+    skin_textures: HashMap<String, egui::TextureHandle>,
+    pending_skin_previews: HashSet<String>,
     builds: Vec<BuildInfo>,
     selected_idx: usize,
     java_label: String,
@@ -132,14 +139,7 @@ impl MineLauncherApp {
         set_builds_root(configured_builds_root(&config));
         let _ = ensure_dirs();
         configure_style(&cc.egui_ctx, config.theme);
-        let steve_texture = config
-            .accounts
-            .get(config.active_account)
-            .filter(|account| is_local_skin_source(&account.skin_source))
-            .and_then(|account| {
-                load_skin_texture(&cc.egui_ctx, Path::new(&account.skin_source)).ok()
-            })
-            .unwrap_or_else(|| load_steve_texture(&cc.egui_ctx));
+        let steve_texture = load_steve_texture(&cc.egui_ctx);
         let storage_path_edit = display_builds_root(&config);
         let (tx, rx) = mpsc::channel();
 
@@ -163,6 +163,8 @@ impl MineLauncherApp {
             ram_mb,
             total_ram_mb,
             steve_texture,
+            skin_textures: HashMap::new(),
+            pending_skin_previews: HashSet::new(),
             config,
             builds: Vec::new(),
             selected_idx: 0,
@@ -198,6 +200,7 @@ impl MineLauncherApp {
         };
 
         app.append_log("Лаунчер запущен");
+        app.load_configured_skin_previews(&cc.egui_ctx);
         app.reload_gallery(&cc.egui_ctx);
         app.refresh_game_log();
         app.reload_builds();
@@ -721,7 +724,58 @@ impl MineLauncherApp {
         self.java_label = java_status(&self.config.java_path);
     }
 
-    fn poll_messages(&mut self) {
+    fn load_configured_skin_previews(&mut self, ctx: &egui::Context) {
+        let sources = self
+            .config
+            .accounts
+            .iter()
+            .map(|account| account.skin_source.clone())
+            .collect::<Vec<_>>();
+        for source in sources {
+            self.ensure_skin_preview(ctx, &source);
+        }
+    }
+
+    fn ensure_skin_preview(&mut self, ctx: &egui::Context, source: &str) {
+        let source = source.trim();
+        if source.is_empty()
+            || self.skin_textures.contains_key(source)
+            || self.pending_skin_previews.contains(source)
+        {
+            return;
+        }
+
+        if is_local_skin_source(source) {
+            if let Ok(texture) = load_skin_texture(ctx, Path::new(source)) {
+                self.skin_textures.insert(source.to_string(), texture);
+            }
+            return;
+        }
+
+        if !source.starts_with("https://") {
+            return;
+        }
+
+        let source = source.to_string();
+        self.pending_skin_previews.insert(source.clone());
+        let worker_source = source.clone();
+        let tx = self.tx.clone();
+        let repaint_ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = skin_sync::load_skin_source(&worker_source);
+            let _ = tx.send(WorkerMsg::SkinPreviewLoaded { source, result });
+            repaint_ctx.request_repaint();
+        });
+    }
+
+    fn skin_texture_for_source(&self, source: &str) -> egui::TextureId {
+        self.skin_textures
+            .get(source.trim())
+            .unwrap_or(&self.steve_texture)
+            .id()
+    }
+
+    fn poll_messages(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
                 WorkerMsg::BuildsOk(builds) => {
@@ -848,6 +902,14 @@ impl MineLauncherApp {
                     }
                     self.refresh_game_log();
                 }
+                WorkerMsg::SkinPreviewLoaded { source, result } => {
+                    self.pending_skin_previews.remove(&source);
+                    if let Ok(data) = result {
+                        if let Ok(texture) = load_skin_texture_from_bytes(ctx, &source, &data) {
+                            self.skin_textures.insert(source, texture);
+                        }
+                    }
+                }
             }
         }
     }
@@ -960,7 +1022,7 @@ impl MineLauncherApp {
         self.account_message.clear();
     }
 
-    fn save_account_draft(&mut self) {
+    fn save_account_draft(&mut self, ctx: &egui::Context) {
         if let Err(error) = Self::validate_username(&self.account_draft.username) {
             self.account_message = error;
             return;
@@ -983,6 +1045,8 @@ impl MineLauncherApp {
         }
         self.config.username = self.username.clone();
         let _ = self.config.save();
+        let skin_source = self.account_draft.skin_source.clone();
+        self.ensure_skin_preview(ctx, &skin_source);
         self.account_editor_open = false;
     }
 
@@ -1116,9 +1180,14 @@ impl MineLauncherApp {
             Vec2::new(40.0, 40.0),
         );
         if let Some(account) = self.config.accounts.get(self.config.active_account) {
-            draw_account_avatar(ui.painter(), avatar, account, palette);
+            draw_account_avatar(
+                ui.painter(),
+                avatar,
+                self.skin_texture_for_source(&account.skin_source),
+                palette,
+            );
         } else {
-            draw_avatar(ui.painter(), avatar, palette);
+            draw_account_avatar(ui.painter(), avatar, self.steve_texture.id(), palette);
         }
         ui.painter().text(
             avatar.right_top() + Vec2::new(11.0, 7.0),
@@ -1542,6 +1611,7 @@ impl MineLauncherApp {
             .get(self.config.active_account)
             .cloned()
             .unwrap_or_default();
+        let skin_texture = self.skin_texture_for_source(&account.skin_source);
         let padding = 24.0;
         let split = (rect.left() + rect.width() * 0.37)
             .clamp(rect.left() + 330.0, rect.left() + 445.0);
@@ -1576,7 +1646,7 @@ impl MineLauncherApp {
             Pos2::new(left.center().x, left.center().y - 38.0),
             Vec2::new(left.width() * 0.78, (left.height() - 170.0).max(330.0)),
         );
-        draw_skin_avatar_3d(ui.painter(), self.steve_texture.id(), model_rect, palette);
+        draw_skin_avatar_3d(ui.painter(), skin_texture, model_rect, palette);
 
         let profile_y = left.bottom() - 89.0;
         ui.painter().text(
@@ -1732,7 +1802,7 @@ impl MineLauncherApp {
                 saved_skin.center() - Vec2::new(0.0, 15.0),
                 Vec2::new(84.0, 105.0),
             );
-            draw_skin_avatar_3d(ui.painter(), self.steve_texture.id(), mini_model, palette);
+            draw_skin_avatar_3d(ui.painter(), skin_texture, mini_model, palette);
             ui.painter().text(
                 saved_skin.center_bottom() - Vec2::new(0.0, 16.0),
                 Align2::CENTER_BOTTOM,
@@ -1811,8 +1881,9 @@ impl MineLauncherApp {
                 if let Some(path) = select_skin_file() {
                     match load_skin_texture(ui.ctx(), &path) {
                         Ok(texture) => {
-                            self.steve_texture = texture;
-                            self.skin_source_draft = path.to_string_lossy().to_string();
+                            let source = path.to_string_lossy().to_string();
+                            self.skin_textures.insert(source.clone(), texture);
+                            self.skin_source_draft = source;
                             self.account_message =
                                 format!("Выбран скин: {}", skin_file_name(&path));
                         }
@@ -1825,7 +1896,7 @@ impl MineLauncherApp {
                 let valid_source = if is_local_skin_source(&source) {
                     match load_skin_texture(ui.ctx(), Path::new(&source)) {
                         Ok(texture) => {
-                            self.steve_texture = texture;
+                            self.skin_textures.insert(source.clone(), texture);
                             true
                         }
                         Err(error) => {
@@ -1842,10 +1913,11 @@ impl MineLauncherApp {
                 };
                 if valid_source {
                     if let Some(active) = self.config.accounts.get_mut(self.config.active_account) {
-                        active.skin_source = source;
+                        active.skin_source = source.clone();
                         active.skin_model = self.skin_model_draft;
                     }
                     let _ = self.config.save();
+                    self.ensure_skin_preview(ui.ctx(), &source);
                     self.account_message = "Скин сохранён в библиотеке".into();
                     open = false;
                 }
@@ -2333,6 +2405,11 @@ impl MineLauncherApp {
     fn draw_accounts_settings(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
         let content = rect.shrink2(Vec2::new(24.0, 18.0));
         let mut pending_action = None;
+        let accounts = self.config.accounts.clone();
+        let account_textures = accounts
+            .iter()
+            .map(|account| self.skin_texture_for_source(&account.skin_source))
+            .collect::<Vec<_>>();
         ui.allocate_new_ui(
             egui::UiBuilder::new()
                 .max_rect(content)
@@ -2349,12 +2426,12 @@ impl MineLauncherApp {
                                 ui.set_width(list_width);
                                 ui.add_space(2.0);
 
-                                let accounts = self.config.accounts.clone();
                                 let can_delete = accounts.len() > 1;
                                 for (index, account) in accounts.iter().enumerate() {
                                     if let Some(action) = account_profile_card(
                                         ui,
                                         account,
+                                        account_textures[index],
                                         index,
                                         self.config.active_account == index,
                                         can_delete,
@@ -2499,7 +2576,7 @@ impl MineLauncherApp {
             });
 
         if save_requested {
-            self.save_account_draft();
+            self.save_account_draft(ctx);
         } else if cancel_requested || !editor_open {
             self.account_editor_open = false;
             self.account_message.clear();
@@ -2620,7 +2697,7 @@ impl MineLauncherApp {
 
 impl eframe::App for MineLauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_messages();
+        self.poll_messages(ctx);
         if self.busy != Busy::Idle {
             ctx.request_repaint_after(Duration::from_millis(40));
         }
@@ -2829,6 +2906,7 @@ fn setting_row(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::U
 fn account_profile_card(
     ui: &mut egui::Ui,
     account: &AccountConfig,
+    skin_texture: egui::TextureId,
     index: usize,
     active: bool,
     can_delete: bool,
@@ -2898,7 +2976,7 @@ fn account_profile_card(
         rect.min + Vec2::new(16.0, 15.0),
         Vec2::splat(52.0),
     );
-    draw_account_avatar(ui.painter(), avatar, account, palette);
+    draw_account_avatar(ui.painter(), avatar, skin_texture, palette);
 
     let text_x = avatar.right() + 18.0;
     ui.painter().text(
@@ -3095,83 +3173,28 @@ fn draw_trash_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
 fn draw_account_avatar(
     painter: &egui::Painter,
     rect: Rect,
-    account: &AccountConfig,
+    skin_texture: egui::TextureId,
     palette: Palette,
 ) {
-    let mut hash = 2_166_136_261_u32;
-    for byte in account.username.bytes() {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    let backgrounds = [
-        Color32::from_rgb(55, 91, 78),
-        Color32::from_rgb(74, 73, 112),
-        Color32::from_rgb(112, 74, 63),
-        Color32::from_rgb(58, 89, 117),
-    ];
-    let hair_colors = [
-        Color32::from_rgb(54, 30, 22),
-        Color32::from_rgb(92, 56, 26),
-        Color32::from_rgb(36, 30, 32),
-        Color32::from_rgb(151, 91, 39),
-    ];
-    let skin_colors = [
-        Color32::from_rgb(242, 190, 148),
-        Color32::from_rgb(213, 153, 111),
-        Color32::from_rgb(166, 110, 76),
-        Color32::from_rgb(238, 177, 131),
-    ];
-    let variant = hash as usize % backgrounds.len();
-    painter.rect_filled(rect, CornerRadius::same(4), backgrounds[variant]);
-
-    let face = rect.shrink2(Vec2::new(9.0, 7.0));
-    let skin = skin_colors[(hash.rotate_left(7) as usize) % skin_colors.len()];
-    let hair = hair_colors[(hash.rotate_left(13) as usize) % hair_colors.len()];
-    painter.rect_filled(face, CornerRadius::ZERO, skin);
-    painter.rect_filled(
-        Rect::from_min_max(face.min, Pos2::new(face.right(), face.top() + 9.0)),
-        CornerRadius::ZERO,
-        hair,
+    painter.rect_filled(rect, CornerRadius::same(4), palette.progress_track);
+    let face_size =
+        (((rect.width().min(rect.height()) - 4.0) / 8.0).floor() * 8.0).max(8.0);
+    let face = Rect::from_center_size(rect.center(), Vec2::splat(face_size));
+    let base_uv = Rect::from_min_max(
+        Pos2::new(8.0 / 64.0, 8.0 / 64.0),
+        Pos2::new(16.0 / 64.0, 16.0 / 64.0),
     );
-    painter.rect_filled(
-        Rect::from_min_max(
-            face.left_top() + Vec2::new(0.0, 7.0),
-            face.left_bottom() + Vec2::new(5.0, -7.0),
-        ),
-        CornerRadius::ZERO,
-        hair,
+    let overlay_uv = Rect::from_min_max(
+        Pos2::new(40.0 / 64.0, 8.0 / 64.0),
+        Pos2::new(48.0 / 64.0, 16.0 / 64.0),
     );
-    painter.rect_filled(
-        Rect::from_min_max(
-            face.right_top() + Vec2::new(-5.0, 7.0),
-            face.right_bottom() + Vec2::new(0.0, -7.0),
-        ),
-        CornerRadius::ZERO,
-        hair,
-    );
-    let eye_color = if hash & 1 == 0 {
-        Color32::from_rgb(51, 87, 67)
-    } else {
-        Color32::from_rgb(55, 72, 105)
-    };
-    let eye_y = face.top() + 19.0;
-    painter.rect_filled(
-        Rect::from_min_size(Pos2::new(face.left() + 7.0, eye_y), Vec2::new(4.0, 4.0)),
-        CornerRadius::ZERO,
-        eye_color,
-    );
-    painter.rect_filled(
-        Rect::from_min_size(Pos2::new(face.right() - 11.0, eye_y), Vec2::new(4.0, 4.0)),
-        CornerRadius::ZERO,
-        eye_color,
-    );
-    painter.rect_filled(
-        Rect::from_center_size(
-            Pos2::new(face.center().x, face.bottom() - 7.0),
-            Vec2::new(8.0, 3.0),
-        ),
-        CornerRadius::ZERO,
-        palette.danger,
+    painter.image(skin_texture, face, base_uv, Color32::WHITE);
+    painter.image(skin_texture, face, overlay_uv, Color32::WHITE);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(4),
+        Stroke::new(1.0, palette.border),
+        egui::StrokeKind::Inside,
     );
 }
 
@@ -3401,28 +3424,6 @@ fn draw_logo(painter: &egui::Painter, rect: Rect) {
     );
 }
 
-fn draw_avatar(painter: &egui::Painter, rect: Rect, palette: Palette) {
-    painter.rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(218, 158, 96));
-    let face = rect.shrink2(Vec2::new(7.0, 5.0));
-    painter.rect_filled(face, CornerRadius::ZERO, Color32::from_rgb(241, 201, 161));
-    let eye = Vec2::splat(4.0);
-    painter.rect_filled(
-        Rect::from_min_size(face.min + Vec2::new(4.0, 9.0), eye),
-        CornerRadius::ZERO,
-        Color32::from_rgb(53, 82, 65),
-    );
-    painter.rect_filled(
-        Rect::from_min_size(face.right_top() + Vec2::new(-8.0, 9.0), eye),
-        CornerRadius::ZERO,
-        Color32::from_rgb(53, 82, 65),
-    );
-    painter.rect_filled(
-        Rect::from_min_size(face.center_bottom() + Vec2::new(-4.0, -7.0), Vec2::new(8.0, 3.0)),
-        CornerRadius::ZERO,
-        palette.danger,
-    );
-}
-
 fn draw_build_icon(painter: &egui::Painter, rect: Rect, palette: Palette) {
     painter.rect_filled(rect, CornerRadius::same(7), palette.code);
     painter.rect_stroke(
@@ -3529,6 +3530,26 @@ fn load_skin_texture(ctx: &egui::Context, path: &Path) -> Result<egui::TextureHa
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
     Ok(ctx.load_texture(
         format!("skin:{}", path.to_string_lossy()),
+        color_image,
+        egui::TextureOptions::NEAREST,
+    ))
+}
+
+fn load_skin_texture_from_bytes(
+    ctx: &egui::Context,
+    source: &str,
+    data: &[u8],
+) -> Result<egui::TextureHandle, String> {
+    let image = image::load_from_memory_with_format(data, image::ImageFormat::Png)
+        .map_err(|_| "Не удалось прочитать PNG-файл".to_string())?
+        .to_rgba8();
+    if image.dimensions() != (64, 64) {
+        return Err("Для превью нужен современный PNG-скин 64×64".into());
+    }
+
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([64, 64], image.as_raw());
+    Ok(ctx.load_texture(
+        format!("skin:{source}"),
         color_image,
         egui::TextureOptions::NEAREST,
     ))

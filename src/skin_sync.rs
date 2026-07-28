@@ -44,17 +44,7 @@ pub fn prepare_for_launch(
         return Ok(SkinSyncOutcome::Disabled);
     }
 
-    let source_data = if source.starts_with("https://") {
-        download_skin(source)?
-    } else if is_local_source(source) {
-        fs::read(source).map_err(|error| format!("Не удалось прочитать PNG-скин: {error}"))?
-    } else {
-        return Err("Выберите локальный PNG 64×64 или укажите прямую HTTPS-ссылку на PNG".into());
-    };
-    // Minecraft accepts several PNG variants, but the network mod intentionally
-    // exchanges one predictable format. Re-encoding here also handles indexed
-    // palette PNGs selected by the user without weakening server-side validation.
-    let data = normalize_skin(&source_data)?;
+    let data = load_skin_source(source)?;
 
     let fingerprint = fingerprint(&data, account.skin_model);
     fs::write(game_dir.join(SKIN_FILE), &data)
@@ -69,6 +59,23 @@ pub fn prepare_for_launch(
     };
     write_request(game_dir, &request)?;
     Ok(SkinSyncOutcome::Ready)
+}
+
+/// Loads and normalizes a configured local or HTTPS skin source for reuse by
+/// launch preparation and UI previews.
+pub fn load_skin_source(source: &str) -> Result<Vec<u8>, String> {
+    let source = source.trim();
+    let source_data = if source.starts_with("https://") {
+        download_skin(source)?
+    } else if is_local_source(source) {
+        fs::read(source).map_err(|error| format!("Не удалось прочитать PNG-скин: {error}"))?
+    } else {
+        return Err("Выберите локальный PNG 64×64 или укажите прямую HTTPS-ссылку на PNG".into());
+    };
+    // Minecraft accepts several PNG variants, but the network mod intentionally
+    // exchanges one predictable format. Re-encoding here also handles indexed
+    // palette PNGs selected by the user without weakening server-side validation.
+    normalize_skin(&source_data)
 }
 
 fn install_mod(game_dir: &Path) -> Result<(), String> {
