@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::time::Duration;
 
@@ -44,14 +44,17 @@ pub fn prepare_for_launch(
         return Ok(SkinSyncOutcome::Disabled);
     }
 
-    let data = if source.starts_with("https://") {
+    let source_data = if source.starts_with("https://") {
         download_skin(source)?
     } else if is_local_source(source) {
         fs::read(source).map_err(|error| format!("Не удалось прочитать PNG-скин: {error}"))?
     } else {
         return Err("Выберите локальный PNG 64×64 или укажите прямую HTTPS-ссылку на PNG".into());
     };
-    validate_skin(&data)?;
+    // Minecraft accepts several PNG variants, but the network mod intentionally
+    // exchanges one predictable format. Re-encoding here also handles indexed
+    // palette PNGs selected by the user without weakening server-side validation.
+    let data = normalize_skin(&source_data)?;
 
     let fingerprint = fingerprint(&data, account.skin_model);
     fs::write(game_dir.join(SKIN_FILE), &data)
@@ -125,7 +128,7 @@ fn download_skin(url: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-fn validate_skin(data: &[u8]) -> Result<(), String> {
+fn normalize_skin(data: &[u8]) -> Result<Vec<u8>, String> {
     if data.is_empty() {
         return Err("PNG-скин пуст".into());
     }
@@ -141,7 +144,15 @@ fn validate_skin(data: &[u8]) -> Result<(), String> {
             dimensions.0, dimensions.1
         ));
     }
-    Ok(())
+
+    let mut normalized = Vec::new();
+    image::DynamicImage::ImageRgba8(image.to_rgba8())
+        .write_to(&mut Cursor::new(&mut normalized), image::ImageFormat::Png)
+        .map_err(|error| format!("Не удалось преобразовать скин в PNG RGBA: {error}"))?;
+    if normalized.len() > MAX_SKIN_BYTES {
+        return Err("Преобразованный PNG-скин должен быть меньше 256 КБ".into());
+    }
+    Ok(normalized)
 }
 
 fn is_local_source(source: &str) -> bool {
@@ -178,7 +189,7 @@ mod tests {
 
     #[test]
     fn rejects_non_png_and_legacy_dimensions() {
-        assert!(validate_skin(b"not a png").is_err());
+        assert!(normalize_skin(b"not a png").is_err());
         let legacy = image::RgbaImage::new(64, 32);
         let mut bytes = Vec::new();
         legacy
@@ -187,7 +198,27 @@ mod tests {
                 image::ImageFormat::Png,
             )
             .unwrap();
-        assert!(validate_skin(&bytes).is_err());
+        assert!(normalize_skin(&bytes).is_err());
+    }
+
+    #[test]
+    fn normalizes_png_to_eight_bit_rgba() {
+        let grayscale = image::GrayImage::from_pixel(64, 64, image::Luma([127]));
+        let mut source = Vec::new();
+        image::DynamicImage::ImageLuma8(grayscale)
+            .write_to(
+                &mut std::io::Cursor::new(&mut source),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        assert_ne!(source[25], 6, "test input should not already be RGBA");
+
+        let normalized = normalize_skin(&source).expect("normalize PNG");
+        assert_eq!(normalized[24], 8, "PNG bit depth");
+        assert_eq!(normalized[25], 6, "PNG color type RGBA");
+        let decoded =
+            image::load_from_memory_with_format(&normalized, image::ImageFormat::Png).unwrap();
+        assert_eq!(decoded.dimensions(), (64, 64));
     }
 
     #[test]
@@ -210,9 +241,12 @@ mod tests {
             fs::read(game_dir.join("mods").join(MOD_FILE)).unwrap(),
             MOD_BYTES
         );
+        let prepared = fs::read(game_dir.join(SKIN_FILE)).unwrap();
+        assert_eq!(prepared[24], 8);
+        assert_eq!(prepared[25], 6);
         assert_eq!(
-            fs::read(game_dir.join(SKIN_FILE)).unwrap(),
-            fs::read(source).unwrap()
+            image::load_from_memory(&prepared).unwrap().to_rgba8(),
+            image::open(source).unwrap().to_rgba8()
         );
 
         let request: Value =
@@ -222,6 +256,15 @@ mod tests {
         assert_eq!(request["username"], "TestPlayer");
         assert_eq!(request["model"], "classic");
         assert!(request["fingerprint"].as_str().unwrap().len() == 40);
+
+        // A newly installed or updated modpack may replace/remove the managed
+        // file. The launcher must restore its embedded copy on every launch.
+        fs::write(game_dir.join("mods").join(MOD_FILE), b"pack copy").unwrap();
+        prepare_for_launch(&account, &game_dir).expect("restore launcher-managed mod");
+        assert_eq!(
+            fs::read(game_dir.join("mods").join(MOD_FILE)).unwrap(),
+            MOD_BYTES
+        );
 
         let _ = fs::remove_dir_all(game_dir);
     }
