@@ -6,5 +6,7 @@
 .vscode/
 *.pdb
 *.exe
-MineLauncher
-MineLauncher-linux-x64
+/MineLauncher
+/MineLauncher-linux-x64
+/client-mod/.gradle/
+/client-mod/run/

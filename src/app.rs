@@ -402,7 +402,6 @@ impl MineLauncherApp {
                 username: username.clone(),
                 ..Default::default()
             });
-        let skin_server_address = self.config.server_address.clone();
 
         self.busy = Busy::Installing;
         self.status = format!("Проверка обновления «{}»…", build.name);
@@ -593,11 +592,7 @@ impl MineLauncherApp {
                         let _ = tx.send(WorkerMsg::Status(
                             "Подготовка синхронизации скина…".into(),
                         ));
-                        Some(skin_sync::prepare_for_launch(
-                            &skin_account,
-                            &game,
-                            &skin_server_address,
-                        ))
+                        Some(skin_sync::prepare_for_launch(&skin_account, &game))
                     }
                     ModLoader::NeoForge { .. } if skin_account.skin_source.trim().is_empty() => None,
                     ModLoader::NeoForge { .. } => Some(Err(format!(
@@ -819,7 +814,9 @@ impl MineLauncherApp {
                     self.status = format!("Запущено: {build}");
                     self.detail = match &skin_sync {
                         Some(Ok(SkinSyncOutcome::Ready)) => {
-                            format!("Игрок {username} · скин применится после входа на сервер")
+                            format!(
+                                "Игрок {username} · скин применится на сервере или в одиночном мире"
+                            )
                         }
                         Some(Err(error)) => {
                             format!("Игра запущена, но скин не синхронизирован: {error}")
@@ -1010,14 +1007,6 @@ impl MineLauncherApp {
         self.delete_account_confirmation = None;
         self.account_message = format!("Профиль {} удалён", removed.username);
         let _ = self.config.save();
-    }
-
-    fn active_skin_command(&self) -> String {
-        self.config
-            .accounts
-            .get(self.config.active_account)
-            .map(skin_command)
-            .unwrap_or_else(|| "/skin update".into())
     }
 
     fn draw_shell(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1656,17 +1645,8 @@ impl MineLauncherApp {
             Stroke::new(1.3, check_color),
         );
         if can_apply && apply_response.clicked() {
-            if is_local_skin_source(&account.skin_source) {
-                self.account_message =
-                    "PNG автоматически загрузится и применится при следующем входе на сервер"
-                        .into();
-            } else {
-                let command = self.active_skin_command();
-                ui.ctx().copy_text(command);
-                self.account_message =
-                    "Скин применится автоматически при входе; команда скопирована как запасной вариант"
-                        .into();
-            }
+            self.account_message =
+                "Скин применится после входа на сервер или в одиночный мир".into();
         }
 
         let tabs_y = right.top() + 1.0;
@@ -1783,7 +1763,6 @@ impl MineLauncherApp {
         if self.skin_editor_open {
             let mut open = true;
             let mut save_clicked = false;
-            let mut copy_clicked = false;
             let mut browse_clicked = false;
             egui::Window::new("Новый скин")
                 .open(&mut open)
@@ -1792,7 +1771,7 @@ impl MineLauncherApp {
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .default_width(430.0)
                 .show(ui.ctx(), |ui| {
-                    ui.label("PNG-файл, ник Minecraft или публичная HTTPS-ссылка");
+                    ui.label("PNG-файл 64×64 или прямая публичная HTTPS-ссылка");
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.skin_source_draft)
@@ -1818,35 +1797,15 @@ impl MineLauncherApp {
                             );
                         });
                     ui.add_space(10.0);
-                    if is_local_skin_source(&self.skin_source_draft) {
-                        ui.label(
-                            RichText::new(
-                                "Локальный PNG будет автоматически загружен через официальный \
-                                 MineSkin API и применён при входе на сервер.",
-                            )
-                            .color(palette.muted),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new(skin_command(&AccountConfig {
-                                username: account.username.clone(),
-                                skin_source: self.skin_source_draft.clone(),
-                                skin_model: self.skin_model_draft,
-                            }))
-                            .monospace()
-                            .color(palette.accent_text),
-                        );
-                    }
+                    ui.label(
+                        RichText::new(
+                            "Лаунчер передаст PNG моду. На выделенном сервере установите тот же \
+                             MineLauncher Skin Sync; одиночная игра работает автоматически.",
+                        )
+                        .color(palette.muted),
+                    );
                     ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        save_clicked = ui.button("Сохранить в библиотеку").clicked();
-                        copy_clicked = ui
-                            .add_enabled(
-                                !is_local_skin_source(&self.skin_source_draft),
-                                egui::Button::new("Копировать команду"),
-                            )
-                            .clicked();
-                    });
+                    save_clicked = ui.button("Сохранить в библиотеку").clicked();
                 });
             if browse_clicked {
                 if let Some(path) = select_skin_file() {
@@ -1861,14 +1820,6 @@ impl MineLauncherApp {
                     }
                 }
             }
-            if copy_clicked {
-                ui.ctx().copy_text(skin_command(&AccountConfig {
-                    username: account.username.clone(),
-                    skin_source: self.skin_source_draft.clone(),
-                    skin_model: self.skin_model_draft,
-                }));
-                self.account_message = "Команда SkinRestorer скопирована".into();
-            }
             if save_clicked {
                 let source = self.skin_source_draft.trim().to_string();
                 let valid_source = if is_local_skin_source(&source) {
@@ -1882,8 +1833,12 @@ impl MineLauncherApp {
                             false
                         }
                     }
-                } else {
+                } else if source.starts_with("https://") {
                     true
+                } else {
+                    self.account_message =
+                        "Выберите локальный PNG 64×64 или укажите HTTPS-ссылку".into();
+                    false
                 };
                 if valid_source {
                     if let Some(active) = self.config.accounts.get_mut(self.config.active_account) {
@@ -2295,8 +2250,8 @@ impl MineLauncherApp {
                         });
                         ui.label(
                             RichText::new(
-                                "Выбранный скин автоматически применяется через SkinsRestorer при входе \
-                                 с NeoForge 1.21.1. Локальные PNG загружаются через MineSkin.",
+                                "Выбранный скин автоматически передаётся модом NeoForge 1.21.1. \
+                                 Для выделенного сервера установите тот же JAR в папку mods.",
                             )
                             .size(11.0)
                             .color(palette.muted),
@@ -2493,7 +2448,7 @@ impl MineLauncherApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.account_draft.skin_source)
                             .desired_width(342.0)
-                            .hint_text("Ник Minecraft, URL или PNG-файл"),
+                            .hint_text("PNG 64×64 или HTTPS-ссылка"),
                     );
                     if ui.button("Файл…").clicked() {
                         if let Some(path) = select_skin_file() {
@@ -2649,7 +2604,7 @@ impl MineLauncherApp {
         ui.painter().text(
             card.center_top() + Vec2::new(0.0, 234.0),
             Align2::CENTER_CENTER,
-            "Сборки Google Drive · NeoForge · офлайн-профили · SkinRestorer",
+            "Сборки Google Drive · NeoForge · офлайн-профили · синхронизация скинов",
             FontId::proportional(12.0),
             palette.muted,
         );
@@ -2768,26 +2723,10 @@ fn empty_account() -> AccountConfig {
     }
 }
 
-fn skin_command(account: &AccountConfig) -> String {
-    let source = account.skin_source.trim().replace('"', "");
-    if source.is_empty() {
-        "/skin update".into()
-    } else if source.starts_with("https://") || source.starts_with("http://") {
-        format!(
-            "/skin url \"{}\" {}",
-            source,
-            account.skin_model.command_value()
-        )
-    } else {
-        format!("/skin set {source}")
-    }
-}
-
 fn is_local_skin_source(source: &str) -> bool {
     let source = source.trim();
     !source.is_empty()
-        && !source.starts_with("https://")
-        && !source.starts_with("http://")
+        && !source.contains("://")
         && (Path::new(source).is_absolute()
             || source.to_ascii_lowercase().ends_with(".png")
             || source.contains('\\')
@@ -2795,7 +2734,8 @@ fn is_local_skin_source(source: &str) -> bool {
 }
 
 fn can_apply_skin_source(source: &str) -> bool {
-    !source.trim().is_empty()
+    let source = source.trim();
+    is_local_skin_source(source) || source.starts_with("https://")
 }
 
 fn validate_skin_file(path: &Path) -> Result<(), String> {
@@ -2811,9 +2751,9 @@ fn validate_skin_file(path: &Path) -> Result<(), String> {
     }
     let (width, height) =
         image::image_dimensions(path).map_err(|_| "Не удалось прочитать PNG-файл".to_string())?;
-    if (width, height) != (64, 64) && (width, height) != (64, 32) {
+    if (width, height) != (64, 64) {
         return Err(format!(
-            "Неверный размер скина: {width}×{height}. Нужен PNG 64×64 или 64×32"
+            "Неверный размер скина: {width}×{height}. Нужен современный PNG 64×64"
         ));
     }
     Ok(())
@@ -3581,24 +3521,9 @@ fn load_steve_texture(ctx: &egui::Context) -> egui::TextureHandle {
 
 fn load_skin_texture(ctx: &egui::Context, path: &Path) -> Result<egui::TextureHandle, String> {
     validate_skin_file(path)?;
-    let mut image = image::open(path)
+    let image = image::open(path)
         .map_err(|_| "Не удалось прочитать PNG-файл".to_string())?
         .to_rgba8();
-
-    // Старые скины 64×32 используют одну текстуру для обеих рук и ног.
-    // Дублируем эти области в позиции современного формата 64×64, чтобы
-    // превью не теряло половину модели.
-    if image.height() == 32 {
-        let mut expanded = image::RgbaImage::new(64, 64);
-        image::imageops::overlay(&mut expanded, &image, 0, 0);
-        for y in 0..16 {
-            for x in 0..16 {
-                expanded.put_pixel(x + 16, y + 48, *image.get_pixel(x, y + 16));
-                expanded.put_pixel(x + 32, y + 48, *image.get_pixel(x + 40, y + 16));
-            }
-        }
-        image = expanded;
-    }
 
     let size = [image.width() as usize, image.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
