@@ -10,3 +10,6 @@
 /MineLauncher-linux-x64
 /client-mod/.gradle/
 /client-mod/run/
+/archives/
+/instances/
+/screenshots/

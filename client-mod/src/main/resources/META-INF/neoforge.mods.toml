@@ -4,7 +4,7 @@ license="MIT"
 
 [[mods]]
 modId="minelauncher_skin_sync"
-version="2.0.0"
+version="2.0.1"
 displayName="MineLauncher Skin Sync"
 authors="MineLauncher"
 description='''
@@ -26,4 +26,13 @@ modId="minecraft"
 type="required"
 versionRange="[1.21.1,1.21.2)"
 ordering="NONE"
+side="BOTH"
+
+# Create performs some registrations during parallel mod construction. Loading
+# after it prevents its registrate state from being observed half-initialized.
+[[dependencies.minelauncher_skin_sync]]
+modId="create"
+type="optional"
+versionRange="[0,)"
+ordering="AFTER"
 side="BOTH"
