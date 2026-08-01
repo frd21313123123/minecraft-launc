@@ -170,3 +170,260 @@ pub fn native_classifier(lib: &Library) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        expand_argument, library_applies, name_native_classifier, native_classifier,
+        native_classifier_matches_host, rules_allow, ARCH, OS_NAME,
+    };
+    use crate::models::{Argument, ArgumentValue, Library, OsRule, Rule};
+    use std::collections::HashMap;
+
+    fn rule(action: &str) -> Rule {
+        Rule {
+            action: action.to_string(),
+            os: None,
+            features: None,
+        }
+    }
+
+    fn host_rule(action: &str) -> Rule {
+        Rule {
+            action: action.to_string(),
+            os: Some(OsRule {
+                name: Some(OS_NAME.to_string()),
+                arch: None,
+                version: None,
+            }),
+            features: None,
+        }
+    }
+
+    fn library(name: &str) -> Library {
+        Library {
+            name: name.to_string(),
+            downloads: None,
+            natives: None,
+            rules: None,
+            extract: None,
+            url: None,
+        }
+    }
+
+    fn host_native_classifier() -> Option<&'static str> {
+        match (OS_NAME, ARCH) {
+            ("windows", "x86_64") => Some("natives-windows"),
+            ("windows", "x86") => Some("natives-windows-x86"),
+            ("windows", "arm64") => Some("natives-windows-arm64"),
+            ("linux", "x86_64") => Some("natives-linux"),
+            ("linux", "x86") => Some("natives-linux-x86"),
+            ("linux", "arm64") => Some("natives-linux-arm64"),
+            ("osx", "x86_64") => Some("natives-macos"),
+            ("osx", "arm64") => Some("natives-macos-arm64"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn absent_or_empty_rules_allow_an_item() {
+        assert!(rules_allow(None));
+        assert!(rules_allow(Some(&[])));
+    }
+
+    #[test]
+    fn rules_use_the_last_matching_action_and_skip_other_platforms() {
+        assert!(rules_allow(Some(&[rule("disallow"), rule("allow")])));
+        assert!(!rules_allow(Some(&[
+            host_rule("allow"),
+            host_rule("disallow"),
+        ])));
+        assert!(rules_allow(Some(&[
+            host_rule("disallow"),
+            host_rule("allow"),
+        ])));
+
+        let non_matching_disallow = Rule {
+            action: "disallow".to_string(),
+            os: Some(OsRule {
+                name: Some("not-this-platform".to_string()),
+                arch: None,
+                version: None,
+            }),
+            features: None,
+        };
+        assert!(rules_allow(Some(&[
+            host_rule("allow"),
+            non_matching_disallow,
+        ])));
+    }
+
+    #[test]
+    fn rules_match_host_architecture_and_disabled_features() {
+        let matching_arch_disallow = Rule {
+            action: "disallow".to_string(),
+            os: Some(OsRule {
+                name: Some(OS_NAME.to_string()),
+                arch: Some(ARCH.to_string()),
+                version: None,
+            }),
+            features: None,
+        };
+        assert!(!rules_allow(Some(&[
+            host_rule("allow"),
+            matching_arch_disallow,
+        ])));
+
+        let non_matching_arch_disallow = Rule {
+            action: "disallow".to_string(),
+            os: Some(OsRule {
+                name: Some(OS_NAME.to_string()),
+                arch: Some("not-this-architecture".to_string()),
+                version: None,
+            }),
+            features: None,
+        };
+        assert!(rules_allow(Some(&[
+            host_rule("allow"),
+            non_matching_arch_disallow,
+        ])));
+
+        let required_feature = Rule {
+            action: "disallow".to_string(),
+            os: None,
+            features: Some(HashMap::from([("is_demo_user".to_string(), true)])),
+        };
+        assert!(rules_allow(Some(&[host_rule("allow"), required_feature])));
+
+        let disabled_feature = Rule {
+            action: "disallow".to_string(),
+            os: None,
+            features: Some(HashMap::from([("is_demo_user".to_string(), false)])),
+        };
+        assert!(!rules_allow(Some(&[host_rule("allow"), disabled_feature])));
+    }
+
+    #[test]
+    fn extracts_native_classifier_from_maven_coordinates() {
+        assert_eq!(
+            name_native_classifier("org.lwjgl:lwjgl:3.3.3:natives-windows"),
+            Some("natives-windows")
+        );
+        assert_eq!(
+            name_native_classifier("org.lwjgl:lwjgl:3.3.3:natives-linux:jar"),
+            Some("natives-linux")
+        );
+        assert_eq!(name_native_classifier("org.lwjgl:lwjgl:3.3.3"), None);
+        assert_eq!(
+            name_native_classifier("org.lwjgl:lwjgl:3.3.3:sources"),
+            None
+        );
+        assert_eq!(name_native_classifier("not-a-maven-name"), None);
+    }
+
+    #[test]
+    fn native_classifiers_match_only_their_supported_platform_and_architecture() {
+        let cases = [
+            ("natives-windows", OS_NAME == "windows" && ARCH == "x86_64"),
+            ("natives-windows-x86", OS_NAME == "windows" && ARCH == "x86"),
+            (
+                "natives-windows-arm64",
+                OS_NAME == "windows" && ARCH == "arm64",
+            ),
+            ("natives-linux", OS_NAME == "linux" && ARCH == "x86_64"),
+            ("natives-linux-x86", OS_NAME == "linux" && ARCH == "x86"),
+            ("natives-linux-i386", OS_NAME == "linux" && ARCH == "x86"),
+            (
+                "natives-linux-aarch64",
+                OS_NAME == "linux" && ARCH == "arm64",
+            ),
+            ("natives-macos", OS_NAME == "osx" && ARCH == "x86_64"),
+            ("natives-osx-arm64", OS_NAME == "osx" && ARCH == "arm64"),
+            ("natives-macos-3.3.7", OS_NAME == "osx"),
+        ];
+
+        for (classifier, expected) in cases {
+            assert_eq!(
+                native_classifier_matches_host(classifier),
+                expected,
+                "unexpected result for {classifier} on {OS_NAME}/{ARCH}"
+            );
+        }
+        assert!(!native_classifier_matches_host("natives-unknown"));
+        assert!(native_classifier_matches_host("sources"));
+    }
+
+    #[test]
+    fn library_applicability_combines_rules_and_native_classifier() {
+        assert!(library_applies(&library("group:artifact:1.0")));
+
+        let mut denied_by_rule = library("group:artifact:1.0");
+        denied_by_rule.rules = Some(vec![host_rule("disallow")]);
+        assert!(!library_applies(&denied_by_rule));
+
+        assert!(!library_applies(&library(
+            "group:artifact:1.0:natives-unknown"
+        )));
+
+        if let Some(classifier) = host_native_classifier() {
+            assert!(library_applies(&library(&format!(
+                "group:artifact:1.0:{classifier}"
+            ))));
+        }
+    }
+
+    #[test]
+    fn expands_simple_and_allowed_ruled_arguments() {
+        assert_eq!(
+            expand_argument(&Argument::Simple("--demo".to_string())),
+            vec!["--demo"]
+        );
+
+        let allowed_single = Argument::Ruled {
+            rules: Some(vec![host_rule("allow")]),
+            value: ArgumentValue::Single("--quick-play".to_string()),
+        };
+        assert_eq!(expand_argument(&allowed_single), vec!["--quick-play"]);
+
+        let unruled_many = Argument::Ruled {
+            rules: None,
+            value: ArgumentValue::Many(vec!["-cp".to_string(), "libraries/*".to_string()]),
+        };
+        assert_eq!(expand_argument(&unruled_many), vec!["-cp", "libraries/*"]);
+    }
+
+    #[test]
+    fn ruled_arguments_are_omitted_when_rules_disallow_them() {
+        let blocked = Argument::Ruled {
+            rules: Some(vec![host_rule("disallow")]),
+            value: ArgumentValue::Many(vec!["--should-not".to_string(), "appear".to_string()]),
+        };
+        assert!(expand_argument(&blocked).is_empty());
+    }
+
+    #[test]
+    fn native_classifier_prefers_legacy_mapping_and_expands_architecture() {
+        let mut lib = library("group:artifact:1.0:natives-unknown");
+        lib.natives = Some(HashMap::from([(
+            OS_NAME.to_string(),
+            "legacy-${arch}".to_string(),
+        )]));
+
+        let expected_arch = if ARCH == "x86_64" { "64" } else { "32" };
+        assert_eq!(
+            native_classifier(&lib),
+            Some(format!("legacy-{expected_arch}"))
+        );
+    }
+
+    #[test]
+    fn native_classifier_falls_back_to_a_matching_maven_classifier() {
+        let unmatched = library("group:artifact:1.0:natives-unknown");
+        assert_eq!(native_classifier(&unmatched), None);
+
+        if let Some(classifier) = host_native_classifier() {
+            let matching = library(&format!("group:artifact:1.0:{classifier}"));
+            assert_eq!(native_classifier(&matching), Some(classifier.to_string()));
+        }
+    }
+}

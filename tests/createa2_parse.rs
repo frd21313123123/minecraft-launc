@@ -6,7 +6,9 @@ use mine_launcher::mmc;
 use mine_launcher::neoforge;
 use mine_launcher::paths;
 
+/// Требует вручную подготовленный экспорт `instances/createa2`.
 #[test]
+#[ignore = "requires a locally unpacked createa2 Prism/MultiMC export"]
 fn parse_createa2_instance() {
     let root = paths::instances_dir().join("createa2");
     assert!(

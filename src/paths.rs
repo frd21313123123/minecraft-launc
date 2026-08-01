@@ -147,4 +147,16 @@ mod tests {
     fn default_builds_root_is_launch_directory() {
         assert_eq!(builds_root(), launch_dir());
     }
+
+    #[test]
+    fn sanitize_build_id_blocks_path_traversal_and_separators() {
+        assert_eq!(sanitize_build_id("../../"), "build");
+        assert_eq!(sanitize_build_id("..\\evil/pack"), "evil_pack");
+        assert_eq!(sanitize_build_id(" My pack! "), "My_pack");
+    }
+
+    #[test]
+    fn sanitize_build_id_preserves_safe_identifiers() {
+        assert_eq!(sanitize_build_id("create-a2_1.21.1"), "create-a2_1.21.1");
+    }
 }

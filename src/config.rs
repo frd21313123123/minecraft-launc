@@ -150,3 +150,72 @@ impl Config {
         fs::write(config_path(), data).map_err(|e| e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_creates_an_account_from_the_legacy_username() {
+        let mut config = Config {
+            username: "  Alex  ".into(),
+            accounts: Vec::new(),
+            active_account: 42,
+            ram_mb: 256,
+            server_name: "   ".into(),
+            ..Config::default()
+        };
+
+        config.normalize();
+
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.active_account, 0);
+        assert_eq!(config.accounts[0].username, "Alex");
+        assert_eq!(config.username, "Alex");
+        assert_eq!(config.ram_mb, 1024);
+        assert_eq!(config.server_name, "МОЯ СБОРКА");
+    }
+
+    #[test]
+    fn normalize_uses_the_selected_account_and_clamps_its_index() {
+        let mut config = Config {
+            username: "legacy".into(),
+            accounts: vec![
+                AccountConfig {
+                    username: "Steve".into(),
+                    ..AccountConfig::default()
+                },
+                AccountConfig {
+                    username: "   ".into(),
+                    ..AccountConfig::default()
+                },
+            ],
+            active_account: 99,
+            ..Config::default()
+        };
+
+        config.normalize();
+
+        assert_eq!(config.active_account, 1);
+        assert_eq!(config.accounts[1].username, "Player");
+        assert_eq!(config.username, "Player");
+    }
+
+    #[test]
+    fn skin_models_have_stable_labels_and_protocol_values() {
+        assert_eq!(SkinModel::Classic.command_value(), "classic");
+        assert_eq!(SkinModel::Slim.command_value(), "slim");
+        assert!(SkinModel::Classic.label().contains("Steve"));
+        assert!(SkinModel::Slim.label().contains("Alex"));
+    }
+
+    #[test]
+    fn partial_config_json_uses_defaults_for_new_fields() {
+        let config: Config = serde_json::from_str(r#"{"username":"Sam"}"#).unwrap();
+
+        assert_eq!(config.username, "Sam");
+        assert!(config.auto_ram);
+        assert_eq!(config.theme, Theme::Dark);
+        assert_eq!(config.accounts.len(), 1);
+    }
+}

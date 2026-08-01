@@ -198,3 +198,130 @@ fn read_max_mem(root: &Path) -> Option<u32> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mine-launcher-mmc-test-{}-{timestamp}-{}",
+                std::process::id(),
+                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn parses_wrapped_prism_export_with_metadata() {
+        let temp = TestDir::new();
+        let instance = temp.path().join("create-a2");
+        fs::create_dir_all(instance.join(".minecraft")).unwrap();
+        fs::write(
+            instance.join("mmc-pack.json"),
+            r#"{
+                "components": [
+                    {"uid": "net.minecraft", "cachedVersion": "1.21.1"},
+                    {"uid": "net.neoforged.neoforge", "version": "21.1.238"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            instance.join("instance.cfg"),
+            "name=\"Create A2\"\nMaxMemAlloc=4096\n",
+        )
+        .unwrap();
+
+        assert!(is_mmc_instance(&instance));
+        let pack = parse_instance(temp.path()).unwrap();
+
+        assert_eq!(pack.name, "Create A2");
+        assert_eq!(pack.minecraft, "1.21.1");
+        assert!(matches!(
+            pack.loader,
+            ModLoader::NeoForge { ref version } if version == "21.1.238"
+        ));
+        assert_eq!(pack.game_dir, instance.join(".minecraft"));
+        assert_eq!(pack.max_mem_mb, Some(4096));
+    }
+
+    #[test]
+    fn reports_an_error_when_the_minecraft_component_is_missing() {
+        let temp = TestDir::new();
+        fs::write(
+            temp.path().join("mmc-pack.json"),
+            r#"{"components":[{"uid":"net.fabricmc.fabric-loader","version":"0.16.10"}]}"#,
+        )
+        .unwrap();
+
+        let error = parse_instance(temp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("нет компонента Minecraft"));
+    }
+
+    #[test]
+    fn loader_version_ids_and_labels_follow_each_loader_convention() {
+        let cases = [
+            (ModLoader::None, "1.21.1", "1.21.1", "Vanilla"),
+            (
+                ModLoader::NeoForge {
+                    version: "21.1.238".into(),
+                },
+                "1.21.1",
+                "neoforge-21.1.238",
+                "NeoForge 21.1.238",
+            ),
+            (
+                ModLoader::Forge {
+                    version: "47.3.0".into(),
+                },
+                "1.20.1",
+                "1.20.1-forge-47.3.0",
+                "Forge 47.3.0",
+            ),
+            (
+                ModLoader::Fabric {
+                    version: "0.16.10".into(),
+                },
+                "1.21.1",
+                "fabric-loader-0.16.10-1.21.1",
+                "Fabric 0.16.10",
+            ),
+            (
+                ModLoader::Quilt {
+                    version: "0.27.1".into(),
+                },
+                "1.21.1",
+                "quilt-loader-0.27.1-1.21.1",
+                "Quilt 0.27.1",
+            ),
+        ];
+
+        for (loader, minecraft, expected_id, expected_label) in cases {
+            assert_eq!(loader.launch_version_id(minecraft), expected_id);
+            assert_eq!(loader.label(), expected_label);
+        }
+    }
+}
