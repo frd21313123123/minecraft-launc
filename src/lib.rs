@@ -12,3 +12,4 @@ pub mod neoforge;
 pub mod paths;
 pub mod rules;
 pub mod skin_sync;
+pub mod updater;

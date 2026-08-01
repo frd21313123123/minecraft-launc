@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
 pub const APP_NAME: &str = "MineLauncher";
-pub const LAUNCHER_VERSION: &str = "1.0.0";
+pub const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Каталог, из которого был запущен лаунчер.
 fn launch_dir() -> PathBuf {

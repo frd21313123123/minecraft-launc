@@ -10,10 +10,37 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Встраивается в бинарник и позволяет rolling-каналу `latest` отличить
+  # установленную сборку от более нового коммита без риска downgrade.
+  MINELAUNCHER_BUILD_COMMIT: ${{ github.sha }}
+
+# Новая сборка той же ветки отменяет старую, чтобы mutable-релиз `latest`
+# не мог быть перезаписан более старым workflow run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require tag to match Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          cargo_version="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          if [[ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "Release tag ${GITHUB_REF_NAME} must match Cargo.toml version ${cargo_version}." >&2
+            exit 1
+          fi
+
   build-windows:
     name: Windows (exe)
+    needs: validate-version
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -25,8 +52,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Test
+        run: cargo test --locked
+
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Package exe
         shell: pwsh
@@ -45,6 +75,7 @@ jobs:
 
   build-linux:
     name: Linux
+    needs: validate-version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -63,8 +94,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Test
+        run: cargo test --locked
+
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Package binary
         run: |
@@ -85,9 +119,12 @@ jobs:
     name: GitHub Release
     needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
-    # Релиз: push в main/master, тег v*, или ручной запуск. Не на PR.
+    # Релиз: push в main/master, тег v*, или ручной запуск с main/master. Не на PR.
     if: >
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/master'
+      )) ||
       (github.event_name == 'push' && (
         github.ref == 'refs/heads/main' ||
         github.ref == 'refs/heads/master' ||
@@ -111,6 +148,30 @@ jobs:
       - name: Prepare files
         run: |
           mv release/MineLauncher.exe release/MineLauncher-windows-x64.exe
+          windows_sha="$(sha256sum release/MineLauncher-windows-x64.exe | awk '{print $1}')"
+          linux_sha="$(sha256sum release/MineLauncher-linux-x64 | awk '{print $1}')"
+          windows_size="$(stat -c%s release/MineLauncher-windows-x64.exe)"
+          linux_size="$(stat -c%s release/MineLauncher-linux-x64)"
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg windows_sha "$windows_sha" \
+            --arg linux_sha "$linux_sha" \
+            --argjson windows_size "$windows_size" \
+            --argjson linux_size "$linux_size" \
+            '{
+              schema: 1,
+              commit: $commit,
+              assets: {
+                "MineLauncher-windows-x64.exe": {
+                  sha256: $windows_sha,
+                  size: $windows_size
+                },
+                "MineLauncher-linux-x64": {
+                  sha256: $linux_sha,
+                  size: $linux_size
+                }
+              }
+            }' > release/MineLauncher-update.json
           ls -lh release/
 
       - name: Resolve release tag and title
@@ -121,24 +182,41 @@ jobs:
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             echo "name=MineLauncher ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
             echo "name=Latest Build" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse stale rolling release
+        if: steps.meta.outputs.tag == 'latest'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq '.object.sha')"
+          if [[ "$current_sha" != "$GITHUB_SHA" ]]; then
+            echo "Refusing to publish stale rolling build $GITHUB_SHA; branch HEAD is $current_sha." >&2
+            exit 1
           fi
 
       - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
+        id: publish_release
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.name }}
           target_commitish: ${{ github.sha }}
           prerelease: ${{ steps.meta.outputs.prerelease }}
           generate_release_notes: true
-          make_latest: true
+          make_latest: ${{ steps.meta.outputs.make_latest }}
+          overwrite_files: true
+          preserve_order: true
           files: |
             release/MineLauncher-windows-x64.exe
             release/MineLauncher-linux-x64
+            release/MineLauncher-update.json
           fail_on_unmatched_files: true
           body: |
             Автоматическая сборка MineLauncher.
@@ -149,3 +227,14 @@ jobs:
             | `MineLauncher-linux-x64` | Linux |
 
             Commit: `${{ github.sha }}`
+
+      - name: Move rolling tag to the published commit
+        if: steps.meta.outputs.tag == 'latest'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" \
+            -f sha="$GITHUB_SHA" \
+            -F force=true

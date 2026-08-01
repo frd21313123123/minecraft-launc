@@ -8,6 +8,10 @@ mod app;
 use app::MineLauncherApp;
 
 fn main() -> eframe::Result<()> {
+    if let Some(exit_code) = mine_launcher::updater::handle_startup_args() {
+        std::process::exit(exit_code);
+    }
+
     let _ = paths::ensure_dirs();
 
     let options = eframe::NativeOptions {

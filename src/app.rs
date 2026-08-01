@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Pos2, Rect, RichText,
-    Sense, Stroke, Vec2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Pos2, Rect, RichText, Sense,
+    Stroke, Vec2,
 };
 
 use mine_launcher::config::{AccountConfig, Config, SkinModel, Theme};
@@ -23,9 +23,10 @@ use mine_launcher::mmc::{self, ModLoader};
 use mine_launcher::neoforge;
 use mine_launcher::paths::{
     builds_root, ensure_dirs, instance_dir, instances_dir, last_launch_log, screenshots_dir,
-    set_builds_root,
+    set_builds_root, LAUNCHER_VERSION,
 };
 use mine_launcher::skin_sync::{self, SkinSyncOutcome};
+use mine_launcher::updater::{self, CheckOutcome, PreparedUpdate, UpdateInfo};
 
 #[derive(Clone)]
 enum WorkerMsg {
@@ -49,6 +50,12 @@ enum WorkerMsg {
         source: String,
         result: Result<Vec<u8>, String>,
     },
+    LauncherUpdateChecked(Result<CheckOutcome, String>),
+    LauncherUpdateProgress {
+        done: u64,
+        total: u64,
+    },
+    LauncherUpdateReady(Result<PreparedUpdate, String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,6 +64,23 @@ enum Busy {
     LoadingBuilds,
     Installing,
     Launching,
+}
+
+#[derive(Clone)]
+enum LauncherUpdateState {
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading {
+        update: UpdateInfo,
+        done: u64,
+        total: u64,
+    },
+    Installing,
+    Failed {
+        message: String,
+        retry: Option<UpdateInfo>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,6 +154,8 @@ pub struct MineLauncherApp {
     account_editor_open: bool,
     delete_account_confirmation: Option<usize>,
     account_message: String,
+    launcher_update: LauncherUpdateState,
+    launcher_update_prompt_open: bool,
 }
 
 impl MineLauncherApp {
@@ -197,6 +223,8 @@ impl MineLauncherApp {
             account_editor_open: false,
             delete_account_confirmation: None,
             account_message: String::new(),
+            launcher_update: LauncherUpdateState::Checking,
+            launcher_update_prompt_open: false,
         };
 
         app.append_log("Лаунчер запущен");
@@ -204,6 +232,7 @@ impl MineLauncherApp {
         app.reload_gallery(&cc.egui_ctx);
         app.refresh_game_log();
         app.reload_builds();
+        app.check_launcher_update(&cc.egui_ctx);
         app
     }
 
@@ -300,6 +329,71 @@ impl MineLauncherApp {
         });
     }
 
+    fn check_launcher_update(&mut self, ctx: &egui::Context) {
+        if matches!(
+            &self.launcher_update,
+            LauncherUpdateState::Downloading { .. } | LauncherUpdateState::Installing
+        ) {
+            return;
+        }
+
+        self.launcher_update = LauncherUpdateState::Checking;
+        self.append_log("Проверка обновлений лаунчера…");
+        let tx = self.tx.clone();
+        let repaint_ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = updater::check_for_update().map_err(|error| error.to_string());
+            let _ = tx.send(WorkerMsg::LauncherUpdateChecked(result));
+            repaint_ctx.request_repaint();
+        });
+    }
+
+    fn start_launcher_update(&mut self, ctx: &egui::Context, update: UpdateInfo) {
+        if matches!(self.busy, Busy::Installing | Busy::Launching) {
+            self.launcher_update_prompt_open = true;
+            self.launcher_update = LauncherUpdateState::Failed {
+                message: "Сначала дождитесь завершения установки или запуска игры.".into(),
+                retry: Some(update),
+            };
+            return;
+        }
+
+        if matches!(
+            &self.launcher_update,
+            LauncherUpdateState::Downloading { .. } | LauncherUpdateState::Installing
+        ) {
+            return;
+        }
+
+        self.launcher_update_prompt_open = true;
+        self.launcher_update = LauncherUpdateState::Downloading {
+            update: update.clone(),
+            done: 0,
+            total: update.size,
+        };
+        self.append_log(format!(
+            "Загрузка обновления лаунчера {}",
+            update.display_version
+        ));
+
+        let tx = self.tx.clone();
+        let repaint_ctx = ctx.clone();
+        thread::spawn(move || {
+            let progress: ProgressFn = Arc::new({
+                let tx = tx.clone();
+                let repaint_ctx = repaint_ctx.clone();
+                move |done, total, _label| {
+                    let _ = tx.send(WorkerMsg::LauncherUpdateProgress { done, total });
+                    repaint_ctx.request_repaint();
+                }
+            });
+            let result = updater::download_update(&update, Some(&progress))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(WorkerMsg::LauncherUpdateReady(result));
+            repaint_ctx.request_repaint();
+        });
+    }
+
     fn save_prefs(&mut self) {
         self.config.username = self.username.trim().to_string();
         self.config.ram_mb = self.ram_mb;
@@ -371,6 +465,15 @@ impl MineLauncherApp {
     }
 
     fn on_play(&mut self) {
+        if matches!(
+            &self.launcher_update,
+            LauncherUpdateState::Downloading { .. } | LauncherUpdateState::Installing
+        ) {
+            self.status = "Обновляется лаунчер".into();
+            self.detail = "Дождитесь завершения обновления лаунчера".into();
+            self.append_log("Запуск игры отложен до завершения обновления лаунчера");
+            return;
+        }
         if self.busy != Busy::Idle {
             return;
         }
@@ -553,9 +656,8 @@ impl MineLauncherApp {
                     ModLoader::None => pack.minecraft.clone(),
                     ModLoader::NeoForge { version } => {
                         if !neoforge::is_neoforge_installed(version) {
-                            let _ = tx.send(WorkerMsg::Status(format!(
-                                "Установка NeoForge {version}…"
-                            )));
+                            let _ = tx
+                                .send(WorkerMsg::Status(format!("Установка NeoForge {version}…")));
                             match neoforge::install_neoforge(
                                 version,
                                 &java,
@@ -592,12 +694,13 @@ impl MineLauncherApp {
 
                 let skin_sync = match &pack.loader {
                     ModLoader::NeoForge { .. } if pack.minecraft == "1.21.1" => {
-                        let _ = tx.send(WorkerMsg::Status(
-                            "Подготовка синхронизации скина…".into(),
-                        ));
+                        let _ =
+                            tx.send(WorkerMsg::Status("Подготовка синхронизации скина…".into()));
                         Some(skin_sync::prepare_for_launch(&skin_account, &game))
                     }
-                    ModLoader::NeoForge { .. } if skin_account.skin_source.trim().is_empty() => None,
+                    ModLoader::NeoForge { .. } if skin_account.skin_source.trim().is_empty() => {
+                        None
+                    }
                     ModLoader::NeoForge { .. } => Some(Err(format!(
                         "Автосинхронизация скина пока поддерживает Minecraft 1.21.1, а в сборке {}",
                         pack.minecraft
@@ -692,8 +795,7 @@ impl MineLauncherApp {
                 None
             } else {
                 Some(Err(
-                    "Для автосинхронизации скина нужна клиентская сборка NeoForge 1.21.1"
-                        .into(),
+                    "Для автосинхронизации скина нужна клиентская сборка NeoForge 1.21.1".into(),
                 ))
             };
             match launch_game_in_dir(&minecraft, &username, ram, &java, &game) {
@@ -910,6 +1012,86 @@ impl MineLauncherApp {
                         }
                     }
                 }
+                WorkerMsg::LauncherUpdateChecked(result) => match result {
+                    Ok(CheckOutcome::UpToDate) => {
+                        self.launcher_update = LauncherUpdateState::UpToDate;
+                        self.append_log("Установлена актуальная версия лаунчера");
+                    }
+                    Ok(CheckOutcome::Available(update)) => {
+                        self.append_log(format!(
+                            "Доступно обновление лаунчера {}",
+                            update.display_version
+                        ));
+                        self.launcher_update = LauncherUpdateState::Available(update);
+                        self.launcher_update_prompt_open = true;
+                    }
+                    Err(error) => {
+                        self.append_log(format!(
+                            "Не удалось проверить обновления лаунчера: {error}"
+                        ));
+                        self.launcher_update = LauncherUpdateState::Failed {
+                            message: error,
+                            retry: None,
+                        };
+                    }
+                },
+                WorkerMsg::LauncherUpdateProgress { done, total } => {
+                    if let LauncherUpdateState::Downloading {
+                        done: current_done,
+                        total: current_total,
+                        ..
+                    } = &mut self.launcher_update
+                    {
+                        *current_done = done;
+                        *current_total = total;
+                    }
+                }
+                WorkerMsg::LauncherUpdateReady(result) => {
+                    let retry = match &self.launcher_update {
+                        LauncherUpdateState::Downloading { update, .. } => Some(update.clone()),
+                        _ => None,
+                    };
+                    match result {
+                        Ok(prepared) => {
+                            if matches!(self.busy, Busy::Installing | Busy::Launching) {
+                                let _ = std::fs::remove_file(&prepared.staged_path);
+                                let message =
+                                    "Сначала дождитесь завершения установки или запуска игры."
+                                        .to_string();
+                                self.append_log(format!(
+                                    "Установка обновления лаунчера отложена: {message}"
+                                ));
+                                self.launcher_update =
+                                    LauncherUpdateState::Failed { message, retry };
+                            } else {
+                                match updater::start_update(&prepared) {
+                                    Ok(()) => {
+                                        self.append_log(
+                                            "Обновление загружено; лаунчер будет перезапущен",
+                                        );
+                                        self.launcher_update = LauncherUpdateState::Installing;
+                                        self.save_prefs();
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    }
+                                    Err(error) => {
+                                        let message = error.to_string();
+                                        self.append_log(format!(
+                                            "Не удалось запустить установку обновления: {message}"
+                                        ));
+                                        self.launcher_update =
+                                            LauncherUpdateState::Failed { message, retry };
+                                    }
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            self.append_log(format!(
+                                "Не удалось загрузить обновление лаунчера: {message}"
+                            ));
+                            self.launcher_update = LauncherUpdateState::Failed { message, retry };
+                        }
+                    }
+                }
             }
         }
     }
@@ -1096,10 +1278,7 @@ impl MineLauncherApp {
             [title.left_bottom(), title.right_bottom()],
             Stroke::new(1.0, palette.border),
         );
-        let logo = Rect::from_min_size(
-            title.min + Vec2::new(10.0, 10.0),
-            Vec2::new(14.0, 14.0),
-        );
+        let logo = Rect::from_min_size(title.min + Vec2::new(10.0, 10.0), Vec2::new(14.0, 14.0));
         draw_logo(ui.painter(), logo);
         ui.painter().text(
             Pos2::new(33.0, title.center().y),
@@ -1119,8 +1298,10 @@ impl MineLauncherApp {
             Pos2::new(sidebar.right(), title.bottom()),
             full.right_bottom(),
         );
-        let top_nav =
-            Rect::from_min_size(main.min, Vec2::new(main.width(), nav_height.min(main.height())));
+        let top_nav = Rect::from_min_size(
+            main.min,
+            Vec2::new(main.width(), nav_height.min(main.height())),
+        );
         if nav_height > 0.0 {
             self.draw_top_nav(ui, top_nav, palette);
         }
@@ -1175,10 +1356,8 @@ impl MineLauncherApp {
         let profile = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 66.0));
         ui.painter()
             .rect_filled(profile, CornerRadius::ZERO, palette.sidebar_profile);
-        let avatar = Rect::from_min_size(
-            profile.min + Vec2::new(16.0, 13.0),
-            Vec2::new(40.0, 40.0),
-        );
+        let avatar =
+            Rect::from_min_size(profile.min + Vec2::new(16.0, 13.0), Vec2::new(40.0, 40.0));
         if let Some(account) = self.config.accounts.get(self.config.active_account) {
             draw_account_avatar(
                 ui.painter(),
@@ -1333,13 +1512,50 @@ impl MineLauncherApp {
             self.navigate_to(ui.ctx(), Page::Settings, None);
             self.refresh_java_label();
         }
-        ui.painter().text(
-            Pos2::new(rect.center().x, rect.bottom() - 7.0),
-            Align2::CENTER_BOTTOM,
-            "v1.0.0",
-            FontId::proportional(10.0),
-            palette.muted,
+        let update_available = matches!(
+            &self.launcher_update,
+            LauncherUpdateState::Available(_)
+                | LauncherUpdateState::Downloading { .. }
+                | LauncherUpdateState::Failed { retry: Some(_), .. }
         );
+        let version_rect = Rect::from_center_size(
+            Pos2::new(rect.center().x, rect.bottom() - 13.0),
+            Vec2::new(rect.width() - 20.0, 24.0),
+        );
+        let version_response = ui
+            .interact(
+                version_rect,
+                ui.id().with("launcher_version"),
+                Sense::click(),
+            )
+            .on_hover_text(if update_available {
+                "Открыть обновление лаунчера"
+            } else {
+                "Открыть страницу «О лаунчере»"
+            });
+        let version_text = if update_available {
+            format!("v{LAUNCHER_VERSION} · ДОСТУПНО ОБНОВЛЕНИЕ")
+        } else {
+            format!("v{LAUNCHER_VERSION}")
+        };
+        ui.painter().text(
+            version_rect.center(),
+            Align2::CENTER_CENTER,
+            version_text,
+            FontId::proportional(10.0),
+            if update_available {
+                palette.accent_text
+            } else {
+                palette.muted
+            },
+        );
+        if version_response.clicked() {
+            if update_available {
+                self.launcher_update_prompt_open = true;
+            } else {
+                self.navigate_to(ui.ctx(), Page::Settings, Some(SettingsTab::About));
+            }
+        }
     }
 
     fn draw_top_nav(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
@@ -1481,10 +1697,7 @@ impl MineLauncherApp {
             );
         }
 
-        let footer = Rect::from_min_max(
-            Pos2::new(rect.left(), hero.bottom()),
-            rect.right_bottom(),
-        );
+        let footer = Rect::from_min_max(Pos2::new(rect.left(), hero.bottom()), rect.right_bottom());
         ui.painter()
             .rect_filled(footer, CornerRadius::ZERO, palette.surface);
         ui.painter().line_segment(
@@ -1563,7 +1776,10 @@ impl MineLauncherApp {
 
         let combo_width = 190.0_f32.min((play_rect.left() - info_left - 20.0).max(120.0));
         let combo_rect = Rect::from_min_size(
-            Pos2::new(play_rect.left() - combo_width - 14.0, footer.center().y - 17.0),
+            Pos2::new(
+                play_rect.left() - combo_width - 14.0,
+                footer.center().y - 17.0,
+            ),
             Vec2::new(combo_width, 34.0),
         );
         let mut requested_build = None;
@@ -1613,8 +1829,8 @@ impl MineLauncherApp {
             .unwrap_or_default();
         let skin_texture = self.skin_texture_for_source(&account.skin_source);
         let padding = 24.0;
-        let split = (rect.left() + rect.width() * 0.37)
-            .clamp(rect.left() + 330.0, rect.left() + 445.0);
+        let split =
+            (rect.left() + rect.width() * 0.37).clamp(rect.left() + 330.0, rect.left() + 445.0);
         let left = Rect::from_min_max(
             rect.min + Vec2::splat(padding),
             Pos2::new(split - 18.0, rect.bottom() - padding),
@@ -1672,8 +1888,7 @@ impl MineLauncherApp {
             Vec2::new((left.width() - 12.0).min(360.0), 36.0),
         );
         let can_apply = can_apply_skin_source(&account.skin_source);
-        let apply_response =
-            ui.interact(apply_rect, ui.id().with("apply_skin"), Sense::click());
+        let apply_response = ui.interact(apply_rect, ui.id().with("apply_skin"), Sense::click());
         ui.painter().rect_filled(
             apply_rect,
             CornerRadius::same(6),
@@ -1727,10 +1942,7 @@ impl MineLauncherApp {
             ("Поиск", false, 72.0),
             ("Плащи", false, 72.0),
         ] {
-            let tab_rect = Rect::from_min_size(
-                Pos2::new(tab_x, tabs_y),
-                Vec2::new(width, 34.0),
-            );
+            let tab_rect = Rect::from_min_size(Pos2::new(tab_x, tabs_y), Vec2::new(width, 34.0));
             if selected {
                 ui.painter()
                     .rect_filled(tab_rect, CornerRadius::same(8), palette.surface);
@@ -1753,8 +1965,7 @@ impl MineLauncherApp {
             Pos2::new(right.left(), right.top() + 46.0),
             Vec2::new(142.0, 160.0),
         );
-        let new_response =
-            ui.interact(new_skin, ui.id().with("new_skin"), Sense::click());
+        let new_response = ui.interact(new_skin, ui.id().with("new_skin"), Sense::click());
         draw_dashed_rect(
             ui.painter(),
             new_skin,
@@ -1996,8 +2207,8 @@ impl MineLauncherApp {
                                         .inner_margin(egui::Margin::same(8))
                                         .show(ui, |ui| {
                                             ui.set_width(card_width - 18.0);
-                                            let image_height =
-                                                ((card_width - 18.0) / item.aspect).clamp(145.0, 240.0);
+                                            let image_height = ((card_width - 18.0) / item.aspect)
+                                                .clamp(145.0, 240.0);
                                             let (image_rect, response) = ui.allocate_exact_size(
                                                 Vec2::new(card_width - 18.0, image_height),
                                                 Sense::click(),
@@ -2078,8 +2289,7 @@ impl MineLauncherApp {
             Pos2::new(top.right() - 27.0, top.center().y),
             Vec2::splat(28.0),
         );
-        let trash_response =
-            ui.interact(trash, ui.id().with("clear_console"), Sense::click());
+        let trash_response = ui.interact(trash, ui.id().with("clear_console"), Sense::click());
         ui.painter().text(
             trash.center(),
             Align2::CENTER_CENTER,
@@ -2253,10 +2463,7 @@ impl MineLauncherApp {
                         ui.add_space(22.0);
                         section_title(ui, "НАСТРОЙКИ JAVA", palette.muted);
                         let auto_ram_changed = ui
-                            .checkbox(
-                                &mut self.config.auto_ram,
-                                "Автоматическое определение RAM",
-                            )
+                            .checkbox(&mut self.config.auto_ram, "Автоматическое определение RAM")
                             .on_hover_text("Половина установленной RAM, но не больше 10 ГБ")
                             .changed();
                         if auto_ram_changed && self.config.auto_ram {
@@ -2278,14 +2485,14 @@ impl MineLauncherApp {
                                             &mut ram,
                                             MIN_RAM_MB as f32..=manual_max as f32,
                                         )
-                                            .step_by(RAM_STEP_MB as f64)
-                                            .show_value(false),
+                                        .step_by(RAM_STEP_MB as f64)
+                                        .show_value(false),
                                     )
                                     .changed()
                                 {
-                                    self.ram_mb =
-                                        ((ram / RAM_STEP_MB as f32).round() as u32 * RAM_STEP_MB)
-                                            .clamp(MIN_RAM_MB, manual_max);
+                                    self.ram_mb = ((ram / RAM_STEP_MB as f32).round() as u32
+                                        * RAM_STEP_MB)
+                                        .clamp(MIN_RAM_MB, manual_max);
                                 }
                             });
                             ui.label(
@@ -2339,8 +2546,7 @@ impl MineLauncherApp {
                             );
                             if ui.button("Выбрать…").clicked() {
                                 if let Some(path) = select_folder() {
-                                    self.storage_path_edit =
-                                        path.to_string_lossy().to_string();
+                                    self.storage_path_edit = path.to_string_lossy().to_string();
                                 }
                             }
                         });
@@ -2529,8 +2735,7 @@ impl MineLauncherApp {
                     );
                     if ui.button("Файл…").clicked() {
                         if let Some(path) = select_skin_file() {
-                            self.account_draft.skin_source =
-                                path.to_string_lossy().to_string();
+                            self.account_draft.skin_source = path.to_string_lossy().to_string();
                         }
                     }
                 });
@@ -2642,7 +2847,10 @@ impl MineLauncherApp {
     fn draw_about(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
         let card = Rect::from_center_size(
             rect.center() - Vec2::new(0.0, 30.0),
-            Vec2::new(570.0_f32.min(rect.width() - 48.0), 360.0),
+            Vec2::new(
+                600.0_f32.min(rect.width() - 48.0),
+                430.0_f32.min(rect.height() - 40.0),
+            ),
         );
         ui.painter()
             .rect_filled(card, CornerRadius::same(14), palette.surface);
@@ -2652,10 +2860,8 @@ impl MineLauncherApp {
             Stroke::new(1.0, palette.border),
             egui::StrokeKind::Inside,
         );
-        let logo = Rect::from_center_size(
-            card.center_top() + Vec2::new(0.0, 72.0),
-            Vec2::splat(52.0),
-        );
+        let logo =
+            Rect::from_center_size(card.center_top() + Vec2::new(0.0, 72.0), Vec2::splat(52.0));
         draw_logo(ui.painter(), logo);
         ui.painter().text(
             card.center_top() + Vec2::new(0.0, 122.0),
@@ -2667,7 +2873,7 @@ impl MineLauncherApp {
         ui.painter().text(
             card.center_top() + Vec2::new(0.0, 153.0),
             Align2::CENTER_CENTER,
-            "Версия 1.0.0 · Rust + egui",
+            format!("Версия {LAUNCHER_VERSION} · Rust + egui"),
             FontId::proportional(13.0),
             palette.muted,
         );
@@ -2685,13 +2891,264 @@ impl MineLauncherApp {
             FontId::proportional(12.0),
             palette.muted,
         );
-        ui.painter().text(
-            card.center_bottom() - Vec2::new(0.0, 38.0),
-            Align2::CENTER_CENTER,
-            "Новости Minecraft намеренно не загружаются.",
-            FontId::proportional(12.0),
-            palette.accent_text,
+        let state = self.launcher_update.clone();
+        let mut check_requested = false;
+        let mut update_requested = None;
+        let status_position = card.center_bottom() - Vec2::new(0.0, 112.0);
+        let action_rect = Rect::from_center_size(
+            card.center_bottom() - Vec2::new(0.0, 48.0),
+            Vec2::new(220.0, 36.0),
         );
+
+        match state {
+            LauncherUpdateState::Checking => {
+                ui.painter().text(
+                    status_position,
+                    Align2::CENTER_CENTER,
+                    "Проверяем обновления…",
+                    FontId::proportional(13.0),
+                    palette.muted,
+                );
+                ui.put(action_rect, egui::Spinner::new());
+            }
+            LauncherUpdateState::UpToDate => {
+                ui.painter().text(
+                    status_position,
+                    Align2::CENTER_CENTER,
+                    "Установлена актуальная версия",
+                    FontId::proportional(13.0),
+                    palette.accent_text,
+                );
+                if ui
+                    .put(action_rect, egui::Button::new("Проверить снова"))
+                    .clicked()
+                {
+                    check_requested = true;
+                }
+            }
+            LauncherUpdateState::Available(update) => {
+                ui.painter().text(
+                    status_position,
+                    Align2::CENTER_CENTER,
+                    format!("Доступно обновление {}", update.display_version),
+                    FontId::proportional(13.0),
+                    palette.accent_text,
+                );
+                if ui
+                    .put(
+                        action_rect,
+                        egui::Button::new(RichText::new("Обновить").color(Color32::WHITE))
+                            .fill(palette.accent),
+                    )
+                    .clicked()
+                {
+                    update_requested = Some(update);
+                }
+            }
+            LauncherUpdateState::Downloading { done, total, .. } => {
+                ui.painter().text(
+                    status_position,
+                    Align2::CENTER_CENTER,
+                    format!("Загрузка обновления: {}", format_bytes(done)),
+                    FontId::proportional(13.0),
+                    palette.accent_text,
+                );
+                let fraction = if total > 0 {
+                    (done as f32 / total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.put(
+                    action_rect,
+                    egui::ProgressBar::new(fraction).text(if total > 0 {
+                        format!("{} / {}", format_bytes(done), format_bytes(total))
+                    } else {
+                        format!("Скачано {}", format_bytes(done))
+                    }),
+                );
+            }
+            LauncherUpdateState::Installing => {
+                ui.painter().text(
+                    status_position,
+                    Align2::CENTER_CENTER,
+                    "Установка обновления и перезапуск…",
+                    FontId::proportional(13.0),
+                    palette.accent_text,
+                );
+                ui.put(action_rect, egui::Spinner::new());
+            }
+            LauncherUpdateState::Failed { retry, .. } => {
+                ui.painter().text(
+                    status_position,
+                    Align2::CENTER_CENTER,
+                    "Не удалось обновить лаунчер",
+                    FontId::proportional(13.0),
+                    palette.danger,
+                );
+                if ui
+                    .put(action_rect, egui::Button::new("Повторить"))
+                    .clicked()
+                {
+                    if let Some(update) = retry {
+                        update_requested = Some(update);
+                    } else {
+                        check_requested = true;
+                    }
+                }
+            }
+        }
+
+        if let Some(update) = update_requested {
+            self.start_launcher_update(ui.ctx(), update);
+        } else if check_requested {
+            self.check_launcher_update(ui.ctx());
+        }
+    }
+
+    fn draw_launcher_update_dialog(&mut self, ctx: &egui::Context, palette: Palette) {
+        if !self.launcher_update_prompt_open {
+            return;
+        }
+
+        let state = self.launcher_update.clone();
+        let mut window_open = true;
+        let mut update_requested = None;
+        let mut check_requested = false;
+        let mut close_requested = false;
+
+        egui::Window::new("Обновление MineLauncher")
+            .id(egui::Id::new("launcher_update_dialog"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .open(&mut window_open)
+            .show(ctx, |ui| {
+                ui.set_width(410.0);
+                match state {
+                    LauncherUpdateState::Available(ref update) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "Доступно обновление {}",
+                                update.display_version
+                            ))
+                            .size(18.0)
+                            .color(palette.text),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Сейчас установлена версия {LAUNCHER_VERSION}. После загрузки лаунчер сам заменит файл и перезапустится."
+                            ))
+                            .color(palette.muted),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "Файл: {} · SHA-256 будет проверен перед установкой",
+                                format_bytes(update.size)
+                            ))
+                            .size(11.0)
+                            .color(palette.muted),
+                        );
+                        ui.add_space(16.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Обновить").color(Color32::WHITE),
+                                    )
+                                    .fill(palette.accent),
+                                )
+                                .clicked()
+                            {
+                                update_requested = Some(update.clone());
+                            }
+                            if ui.button("Позже").clicked() {
+                                close_requested = true;
+                            }
+                        });
+                    }
+                    LauncherUpdateState::Downloading { done, total, .. } => {
+                        ui.label(
+                            RichText::new("Загрузка обновления…")
+                                .size(18.0)
+                                .color(palette.text),
+                        );
+                        ui.add_space(10.0);
+                        let fraction = if total > 0 {
+                            (done as f32 / total as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .show_percentage()
+                                .text(if total > 0 {
+                                    format!("{} / {}", format_bytes(done), format_bytes(total))
+                                } else {
+                                    format!("Скачано {}", format_bytes(done))
+                                }),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("После проверки файл установится автоматически.")
+                                .size(11.0)
+                                .color(palette.muted),
+                        );
+                    }
+                    LauncherUpdateState::Installing => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Перезапускаем лаунчер…")
+                                    .size(16.0)
+                                    .color(palette.text),
+                            );
+                        });
+                    }
+                    LauncherUpdateState::Failed {
+                        ref message,
+                        ref retry,
+                    } => {
+                        ui.label(
+                            RichText::new("Не удалось обновить лаунчер")
+                                .size(18.0)
+                                .color(palette.danger),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(message).color(palette.text));
+                        ui.add_space(16.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Повторить").clicked() {
+                                if let Some(update) = retry.clone() {
+                                    update_requested = Some(update);
+                                } else {
+                                    check_requested = true;
+                                }
+                            }
+                            if ui.button("Закрыть").clicked() {
+                                close_requested = true;
+                            }
+                        });
+                    }
+                    LauncherUpdateState::Checking | LauncherUpdateState::UpToDate => {
+                        close_requested = true;
+                    }
+                }
+            });
+
+        if let Some(update) = update_requested {
+            self.start_launcher_update(ctx, update);
+        } else if check_requested {
+            self.check_launcher_update(ctx);
+        } else if close_requested || !window_open {
+            if !matches!(
+                &self.launcher_update,
+                LauncherUpdateState::Downloading { .. } | LauncherUpdateState::Installing
+            ) {
+                self.launcher_update_prompt_open = false;
+            }
+        }
     }
 }
 
@@ -2709,6 +3166,8 @@ impl eframe::App for MineLauncherApp {
         egui::CentralPanel::default()
             .frame(Frame::NONE)
             .show(ctx, |ui| self.draw_shell(ui, ctx));
+        self.draw_launcher_update_dialog(ctx, Palette::for_theme(self.config.theme));
+        updater::mark_startup_healthy();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2846,8 +3305,8 @@ fn skin_file_name(path: &Path) -> String {
 fn java_status(configured: &str) -> String {
     match find_java(configured) {
         Some(path) => {
-            let version = java_version_string(&path)
-                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            let version =
+                java_version_string(&path).unwrap_or_else(|| path.to_string_lossy().to_string());
             format!("Найдена: {version}")
         }
         None => "Java пока не установлена — скачается автоматически при запуске".into(),
@@ -2858,7 +3317,13 @@ fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
     } else {
-        format!("{}…", value.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            value
+                .chars()
+                .take(max.saturating_sub(1))
+                .collect::<String>()
+        )
     }
 }
 
@@ -2912,11 +3377,12 @@ fn account_profile_card(
     can_delete: bool,
     palette: Palette,
 ) -> Option<AccountCardAction> {
-    let (rect, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 82.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 82.0), Sense::hover());
     let id = ui.id().with(("account_card", index));
-    let body_rect =
-        Rect::from_min_max(rect.min, Pos2::new((rect.right() - 88.0).max(rect.left()), rect.bottom()));
+    let body_rect = Rect::from_min_max(
+        rect.min,
+        Pos2::new((rect.right() - 88.0).max(rect.left()), rect.bottom()),
+    );
     let body_response = ui
         .interact(body_rect, id.with("activate"), Sense::click())
         .on_hover_text(if active {
@@ -2951,31 +3417,30 @@ fn account_profile_card(
             "Нельзя удалить единственный профиль"
         });
 
-    let hover_t = ui
-        .ctx()
-        .animate_bool_with_time(id.with("hovered"), body_response.hovered(), 0.12);
+    let hover_t =
+        ui.ctx()
+            .animate_bool_with_time(id.with("hovered"), body_response.hovered(), 0.12);
     let fill = if hover_t > 0.0 {
         mix_color(palette.surface, palette.progress_track, hover_t * 0.72)
     } else {
         palette.surface
     };
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(10), fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
     ui.painter().rect_stroke(
         rect,
         CornerRadius::same(10),
-        Stroke::new(if active { 2.0 } else { 1.0 }, if active {
-            palette.accent
-        } else {
-            palette.border
-        }),
+        Stroke::new(
+            if active { 2.0 } else { 1.0 },
+            if active {
+                palette.accent
+            } else {
+                palette.border
+            },
+        ),
         egui::StrokeKind::Inside,
     );
 
-    let avatar = Rect::from_min_size(
-        rect.min + Vec2::new(16.0, 15.0),
-        Vec2::splat(52.0),
-    );
+    let avatar = Rect::from_min_size(rect.min + Vec2::new(16.0, 15.0), Vec2::splat(52.0));
     draw_account_avatar(ui.painter(), avatar, skin_texture, palette);
 
     let text_x = avatar.right() + 18.0;
@@ -3062,11 +3527,7 @@ fn add_account_button(ui: &mut egui::Ui, palette: Palette) -> egui::Response {
         Vec2::new(264.0_f32.min(row_rect.width()), 38.0),
     );
     let response = ui
-        .interact(
-            button_rect,
-            ui.id().with("add_account"),
-            Sense::click(),
-        )
+        .interact(button_rect, ui.id().with("add_account"), Sense::click())
         .on_hover_text("Создать ещё один офлайн-профиль");
 
     if response.hovered() {
@@ -3101,38 +3562,23 @@ fn add_account_button(ui: &mut egui::Ui, palette: Palette) -> egui::Response {
 
 fn draw_pencil_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
     painter.line_segment(
-        [
-            center + Vec2::new(-5.0, 5.0),
-            center + Vec2::new(4.5, -4.5),
-        ],
+        [center + Vec2::new(-5.0, 5.0), center + Vec2::new(4.5, -4.5)],
         Stroke::new(1.5, color),
     );
     painter.line_segment(
-        [
-            center + Vec2::new(-3.0, 7.0),
-            center + Vec2::new(6.5, -2.5),
-        ],
+        [center + Vec2::new(-3.0, 7.0), center + Vec2::new(6.5, -2.5)],
         Stroke::new(1.5, color),
     );
     painter.line_segment(
-        [
-            center + Vec2::new(4.5, -4.5),
-            center + Vec2::new(6.5, -2.5),
-        ],
+        [center + Vec2::new(4.5, -4.5), center + Vec2::new(6.5, -2.5)],
         Stroke::new(1.5, color),
     );
     painter.line_segment(
-        [
-            center + Vec2::new(-5.0, 5.0),
-            center + Vec2::new(-5.8, 7.8),
-        ],
+        [center + Vec2::new(-5.0, 5.0), center + Vec2::new(-5.8, 7.8)],
         Stroke::new(1.5, color),
     );
     painter.line_segment(
-        [
-            center + Vec2::new(-5.8, 7.8),
-            center + Vec2::new(-3.0, 7.0),
-        ],
+        [center + Vec2::new(-5.8, 7.8), center + Vec2::new(-3.0, 7.0)],
         Stroke::new(1.5, color),
     );
 }
@@ -3161,10 +3607,7 @@ fn draw_trash_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
     );
     for x in [-2.0, 2.0] {
         painter.line_segment(
-            [
-                center + Vec2::new(x, 0.0),
-                center + Vec2::new(x, 5.0),
-            ],
+            [center + Vec2::new(x, 0.0), center + Vec2::new(x, 5.0)],
             Stroke::new(1.0, color),
         );
     }
@@ -3177,8 +3620,7 @@ fn draw_account_avatar(
     palette: Palette,
 ) {
     painter.rect_filled(rect, CornerRadius::same(4), palette.progress_track);
-    let face_size =
-        (((rect.width().min(rect.height()) - 4.0) / 8.0).floor() * 8.0).max(8.0);
+    let face_size = (((rect.width().min(rect.height()) - 4.0) / 8.0).floor() * 8.0).max(8.0);
     let face = Rect::from_center_size(rect.center(), Vec2::splat(face_size));
     let base_uv = Rect::from_min_max(
         Pos2::new(8.0 / 64.0, 8.0 / 64.0),
@@ -3340,9 +3782,8 @@ fn color_with_alpha(color: Color32, opacity: f32) -> Color32 {
 
 fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
     let amount = amount.clamp(0.0, 1.0);
-    let channel = |start: u8, end: u8| {
-        (start as f32 + (end as f32 - start as f32) * amount).round() as u8
-    };
+    let channel =
+        |start: u8, end: u8| (start as f32 + (end as f32 - start as f32) * amount).round() as u8;
     Color32::from_rgba_unmultiplied(
         channel(from.r(), to.r()),
         channel(from.g(), to.g()),
@@ -3353,11 +3794,17 @@ fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
 
 fn draw_eye_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
     painter.line_segment(
-        [center + Vec2::new(-7.0, 0.0), center + Vec2::new(-2.5, -3.5)],
+        [
+            center + Vec2::new(-7.0, 0.0),
+            center + Vec2::new(-2.5, -3.5),
+        ],
         Stroke::new(1.1, color),
     );
     painter.line_segment(
-        [center + Vec2::new(-2.5, -3.5), center + Vec2::new(2.5, -3.5)],
+        [
+            center + Vec2::new(-2.5, -3.5),
+            center + Vec2::new(2.5, -3.5),
+        ],
         Stroke::new(1.1, color),
     );
     painter.line_segment(
@@ -3432,7 +3879,11 @@ fn draw_build_icon(painter: &egui::Painter, rect: Rect, palette: Palette) {
         Stroke::new(1.0, palette.border),
         egui::StrokeKind::Inside,
     );
-    painter.circle_filled(rect.center(), rect.width() * 0.29, Color32::from_rgb(196, 75, 28));
+    painter.circle_filled(
+        rect.center(),
+        rect.width() * 0.29,
+        Color32::from_rgb(196, 75, 28),
+    );
     painter.circle_stroke(
         rect.center(),
         rect.width() * 0.21,
@@ -3809,7 +4260,10 @@ fn draw_empty_gallery(painter: &egui::Painter, rect: Rect, palette: Palette) {
     let center = rect.center() - Vec2::new(0.0, 22.0);
     let card = Rect::from_center_size(
         center,
-        Vec2::new(540.0_f32.min(rect.width() - 20.0), 260.0_f32.min(rect.height() - 20.0)),
+        Vec2::new(
+            540.0_f32.min(rect.width() - 20.0),
+            260.0_f32.min(rect.height() - 20.0),
+        ),
     );
     painter.rect_filled(card, CornerRadius::same(14), palette.surface);
     painter.rect_stroke(
@@ -3818,7 +4272,10 @@ fn draw_empty_gallery(painter: &egui::Painter, rect: Rect, palette: Palette) {
         Stroke::new(1.0, palette.border),
         egui::StrokeKind::Inside,
     );
-    let icon = Rect::from_center_size(card.center_top() + Vec2::new(0.0, 82.0), Vec2::new(82.0, 58.0));
+    let icon = Rect::from_center_size(
+        card.center_top() + Vec2::new(0.0, 82.0),
+        Vec2::new(82.0, 58.0),
+    );
     painter.rect_stroke(
         icon,
         CornerRadius::same(8),
@@ -4040,14 +4497,12 @@ fn configure_style(ctx: &egui::Context, theme: Theme) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = Vec2::new(9.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        FontId::proportional(14.0),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        FontId::proportional(13.5),
-    );
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, FontId::proportional(13.5));
     ctx.set_style(style);
 
     let mut visuals = match theme {
