@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Pos2, Rect, RichText, Sense,
-    Stroke, Vec2,
+    self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
+    Frame, Layout, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
 
 use mine_launcher::config::{AccountConfig, Config, SkinModel, Theme};
@@ -107,6 +107,65 @@ enum AccountCardAction {
 }
 
 const PAGE_TRANSITION_SECONDS: f32 = 0.32;
+const DISPLAY_FONT_FAMILY: &str = "editorial_display";
+const ITALIC_FONT_FAMILY: &str = "editorial_italic";
+const BODY_FONT_FAMILY: &str = "editorial_body";
+const META_FONT_FAMILY: &str = "editorial_meta";
+
+fn display_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(DISPLAY_FONT_FAMILY.into()))
+}
+
+fn italic_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(ITALIC_FONT_FAMILY.into()))
+}
+
+fn body_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(BODY_FONT_FAMILY.into()))
+}
+
+fn meta_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(META_FONT_FAMILY.into()))
+}
+
+#[derive(Clone, Copy)]
+struct EditorialLayout {
+    masthead: Rect,
+    sidebar: Rect,
+    content: Rect,
+    instrument: Option<Rect>,
+}
+
+fn editorial_layout(full: Rect) -> EditorialLayout {
+    let masthead_height = if full.height() < 680.0 { 64.0 } else { 72.0 };
+    let instrument_width = if full.width() >= 1120.0 { 54.0 } else { 0.0 };
+    let content_right = full.right() - instrument_width;
+    let sidebar_width: f32 = if full.width() < 1080.0 { 224.0 } else { 252.0 };
+    let masthead = Rect::from_min_max(
+        full.min,
+        Pos2::new(content_right, full.top() + masthead_height),
+    );
+    let body = Rect::from_min_max(
+        Pos2::new(full.left(), masthead.bottom()),
+        Pos2::new(content_right, full.bottom()),
+    );
+    let sidebar = Rect::from_min_max(
+        body.min,
+        Pos2::new(
+            body.left() + sidebar_width.min(body.width() * 0.3),
+            body.bottom(),
+        ),
+    );
+    let content = Rect::from_min_max(sidebar.right_top(), body.right_bottom());
+    let instrument = (instrument_width > 0.0)
+        .then(|| Rect::from_min_max(Pos2::new(content_right, full.top()), full.right_bottom()));
+    EditorialLayout {
+        masthead,
+        sidebar,
+        content,
+        instrument,
+    }
+}
 
 struct GalleryItem {
     path: PathBuf,
@@ -165,6 +224,7 @@ impl MineLauncherApp {
         config.normalize();
         set_builds_root(configured_builds_root(&config));
         let _ = ensure_dirs();
+        install_editorial_fonts(&cc.egui_ctx);
         configure_style(&cc.egui_ctx, config.theme);
         let steve_texture = load_steve_texture(&cc.egui_ctx);
         let storage_path_edit = display_builds_root(&config);
@@ -1257,6 +1317,7 @@ impl MineLauncherApp {
         let _ = self.config.save();
     }
 
+    #[allow(dead_code)]
     fn draw_shell(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let palette = Palette::for_theme(self.config.theme);
         let full = ui.max_rect();
@@ -1278,10 +1339,7 @@ impl MineLauncherApp {
         );
         self.draw_sidebar(ui, sidebar, palette);
 
-        let main = Rect::from_min_max(
-            sidebar.right_top(),
-            full.right_bottom(),
-        );
+        let main = Rect::from_min_max(sidebar.right_top(), full.right_bottom());
         let top_nav = Rect::from_min_size(
             main.min,
             Vec2::new(main.width(), nav_height.min(main.height())),
@@ -1329,6 +1387,7 @@ impl MineLauncherApp {
         }
     }
 
+    #[allow(dead_code)]
     fn draw_sidebar(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, palette.sidebar);
@@ -1542,6 +1601,7 @@ impl MineLauncherApp {
         }
     }
 
+    #[allow(dead_code)]
     fn draw_top_nav(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, palette.titlebar);
@@ -1595,6 +1655,7 @@ impl MineLauncherApp {
         }
     }
 
+    #[allow(dead_code)]
     fn draw_home(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
         let footer_height = 76.0_f32.min(rect.height() * 0.18);
         let hero = Rect::from_min_max(
@@ -1811,6 +1872,692 @@ impl MineLauncherApp {
         }
     }
 
+    fn draw_editorial_shell(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let palette = Palette::for_theme(self.config.theme);
+        let full = ui.max_rect();
+        let layout = editorial_layout(full);
+
+        ui.painter()
+            .rect_filled(full, CornerRadius::ZERO, palette.background);
+        let masthead = layout.masthead;
+        let sidebar = layout.sidebar;
+        let content = layout.content;
+
+        for ratio in [0.25_f32, 0.5, 0.75] {
+            let x = content.left() + content.width() * ratio;
+            ui.painter().line_segment(
+                [Pos2::new(x, content.top()), Pos2::new(x, content.bottom())],
+                Stroke::new(1.0, color_with_alpha(palette.border, 0.38)),
+            );
+        }
+
+        self.draw_editorial_top_nav(ui, masthead, sidebar.width(), palette);
+        self.draw_editorial_sidebar(ui, sidebar, palette);
+
+        let (offset, opacity, _, transition_active) = self.transition_frame(ctx);
+        let animated_content = content.translate(Vec2::new(offset, 0.0));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content), |content_ui| {
+            content_ui.set_clip_rect(content);
+            content_ui.set_opacity(opacity);
+            if transition_active {
+                content_ui.disable();
+            }
+            match self.page {
+                Page::Home => self.draw_editorial_home(content_ui, animated_content, palette),
+                Page::Skins => self.draw_skins(content_ui, animated_content, palette),
+                Page::Gallery => self.draw_gallery(content_ui, animated_content, ctx, palette),
+                Page::Console => self.draw_console(content_ui, animated_content, palette),
+                Page::Settings => self.draw_settings(content_ui, animated_content, palette),
+            }
+        });
+
+        let fraction = self.editorial_progress_fraction(ui);
+        if let Some(instrument) = layout.instrument {
+            draw_editorial_instrument(ui, instrument, fraction, self.busy, palette);
+        } else if self.busy != Busy::Idle {
+            let progress = Rect::from_min_size(full.min, Vec2::new(full.width() * fraction, 2.0));
+            ui.painter()
+                .rect_filled(progress, CornerRadius::ZERO, palette.accent);
+        }
+
+        draw_editorial_grain(ui.painter(), full, palette);
+    }
+
+    fn draw_editorial_top_nav(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        sidebar_width: f32,
+        palette: Palette,
+    ) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, palette.titlebar);
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            Stroke::new(1.0, palette.border),
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.left() + sidebar_width, rect.top()),
+                Pos2::new(rect.left() + sidebar_width, rect.bottom()),
+            ],
+            Stroke::new(1.0, palette.border),
+        );
+
+        ui.painter().text(
+            Pos2::new(rect.left() + 20.0, rect.center().y - 1.0),
+            Align2::LEFT_CENTER,
+            "MINE / LAUNCHER",
+            display_font(if rect.height() < 70.0 { 16.0 } else { 18.0 }),
+            palette.text,
+        );
+        ui.painter().circle_filled(
+            Pos2::new(rect.left() + sidebar_width - 21.0, rect.center().y),
+            3.0,
+            palette.accent,
+        );
+
+        let mut x = rect.left() + sidebar_width + 26.0;
+        if self.page == Page::Settings {
+            for (tab, label, width) in [
+                (SettingsTab::General, "ОСНОВНОЕ", 96.0),
+                (SettingsTab::Accounts, "ПРОФИЛИ", 92.0),
+                (SettingsTab::About, "О ЛАУНЧЕРЕ", 124.0),
+            ] {
+                let tab_rect =
+                    Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(width, rect.height()));
+                if editorial_top_tab(ui, tab_rect, label, self.settings_tab == tab, palette)
+                    .clicked()
+                {
+                    self.navigate_to(ui.ctx(), Page::Settings, Some(tab));
+                }
+                x += width + 10.0;
+            }
+        } else {
+            for (page, label, width) in [
+                (Page::Home, "УСТАНОВКИ", 106.0),
+                (Page::Skins, "СКИНЫ", 74.0),
+                (Page::Gallery, "ГАЛЕРЕЯ", 92.0),
+            ] {
+                let tab_rect =
+                    Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(width, rect.height()));
+                if editorial_top_tab(ui, tab_rect, label, self.page == page, palette).clicked() {
+                    self.navigate_to(ui.ctx(), page, None);
+                }
+                x += width + 10.0;
+            }
+            if self.page == Page::Console && rect.width() > 880.0 {
+                let console_rect =
+                    Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(92.0, rect.height()));
+                editorial_top_tab(ui, console_rect, "КОНСОЛЬ", true, palette);
+            }
+        }
+
+        if rect.width() > 870.0 {
+            ui.painter().text(
+                Pos2::new(rect.right() - 22.0, rect.center().y),
+                Align2::RIGHT_CENTER,
+                format!("VOL. 01 — v{LAUNCHER_VERSION}"),
+                meta_font(10.5),
+                palette.muted,
+            );
+        }
+    }
+
+    fn draw_editorial_sidebar(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, palette.sidebar);
+        ui.painter().line_segment(
+            [rect.right_top(), rect.right_bottom()],
+            Stroke::new(1.0, palette.border),
+        );
+
+        let profile = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 108.0));
+        ui.painter().text(
+            profile.left_top() + Vec2::new(20.0, 17.0),
+            Align2::LEFT_TOP,
+            "ACTIVE PROFILE",
+            meta_font(9.5),
+            palette.accent,
+        );
+        let avatar = Rect::from_min_size(
+            profile.left_top() + Vec2::new(20.0, 43.0),
+            Vec2::splat(38.0),
+        );
+        if let Some(account) = self.config.accounts.get(self.config.active_account) {
+            draw_account_avatar(
+                ui.painter(),
+                avatar,
+                self.skin_texture_for_source(&account.skin_source),
+                palette,
+            );
+        } else {
+            draw_account_avatar(ui.painter(), avatar, self.steve_texture.id(), palette);
+        }
+        ui.painter().text(
+            avatar.right_top() + Vec2::new(12.0, 5.0),
+            Align2::LEFT_TOP,
+            truncate(&self.username, 17),
+            display_font(16.0),
+            palette.text,
+        );
+        ui.painter().text(
+            avatar.right_bottom() + Vec2::new(12.0, -6.0),
+            Align2::LEFT_BOTTOM,
+            "OFFLINE / READY",
+            meta_font(9.0),
+            palette.muted,
+        );
+        if ui
+            .interact(profile, ui.id().with("editorial_profile"), Sense::click())
+            .on_hover_text("Открыть профили")
+            .clicked()
+        {
+            self.navigate_to(ui.ctx(), Page::Settings, Some(SettingsTab::Accounts));
+        }
+        ui.painter().line_segment(
+            [profile.left_bottom(), profile.right_bottom()],
+            Stroke::new(1.0, palette.border),
+        );
+
+        let footer_height = 104.0;
+        let navigation_rect = Rect::from_min_max(
+            Pos2::new(rect.left(), profile.bottom()),
+            Pos2::new(rect.right(), rect.bottom() - footer_height),
+        );
+        let mut requested_build = None;
+        let mut console_clicked = false;
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(navigation_rect)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                ui.add_space(19.0);
+                ui.label(
+                    RichText::new("LIBRARY / INDEX")
+                        .font(meta_font(9.5))
+                        .color(palette.accent),
+                );
+                ui.add_space(9.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("editorial_build_index")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(navigation_rect.width());
+                        if self.builds.is_empty() {
+                            let (empty, _) = ui.allocate_exact_size(
+                                Vec2::new(navigation_rect.width(), 66.0),
+                                Sense::hover(),
+                            );
+                            ui.painter().text(
+                                empty.left_center() + Vec2::new(20.0, -8.0),
+                                Align2::LEFT_CENTER,
+                                "00",
+                                meta_font(10.0),
+                                palette.muted,
+                            );
+                            ui.painter().text(
+                                empty.left_center() + Vec2::new(52.0, -8.0),
+                                Align2::LEFT_CENTER,
+                                if self.busy == Busy::LoadingBuilds {
+                                    "Загрузка каталога…"
+                                } else {
+                                    "Сборки не найдены"
+                                },
+                                display_font(14.0),
+                                palette.muted,
+                            );
+                        } else {
+                            for (index, build) in self.builds.iter().enumerate() {
+                                let (row, _) = ui.allocate_exact_size(
+                                    Vec2::new(navigation_rect.width(), 62.0),
+                                    Sense::hover(),
+                                );
+                                let selected = self.selected_idx == index
+                                    && matches!(
+                                        self.page,
+                                        Page::Home | Page::Skins | Page::Gallery
+                                    );
+                                if editorial_side_button(
+                                    ui,
+                                    ("editorial_build", build.id.as_str()),
+                                    row,
+                                    &format!("{:02}", index + 1),
+                                    &build.name,
+                                    selected,
+                                    self.busy == Busy::Idle,
+                                    palette,
+                                )
+                                .clicked()
+                                {
+                                    requested_build = Some(index);
+                                }
+                            }
+                        }
+
+                        ui.add_space(16.0);
+                        let (console_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(navigation_rect.width(), 58.0),
+                            Sense::hover(),
+                        );
+                        console_clicked = editorial_side_button(
+                            ui,
+                            "editorial_console",
+                            console_rect,
+                            "C",
+                            "Консоль",
+                            self.page == Page::Console,
+                            true,
+                            palette,
+                        )
+                        .clicked();
+                    });
+            },
+        );
+
+        if let Some(index) = requested_build {
+            self.select_build(index);
+            self.navigate_to(ui.ctx(), Page::Home, None);
+        }
+        if console_clicked {
+            self.navigate_to(ui.ctx(), Page::Console, None);
+            self.refresh_game_log();
+        }
+
+        let settings_rect = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.bottom() - footer_height),
+            Vec2::new(rect.width(), 62.0),
+        );
+        if editorial_side_button(
+            ui,
+            "editorial_settings",
+            settings_rect,
+            "S",
+            "Настройки",
+            self.page == Page::Settings,
+            true,
+            palette,
+        )
+        .clicked()
+        {
+            self.navigate_to(ui.ctx(), Page::Settings, None);
+            self.refresh_java_label();
+        }
+
+        let update_available = matches!(
+            &self.launcher_update,
+            LauncherUpdateState::Available(_)
+                | LauncherUpdateState::Downloading { .. }
+                | LauncherUpdateState::Failed { retry: Some(_), .. }
+        );
+        let version_rect = Rect::from_min_max(
+            Pos2::new(rect.left() + 20.0, settings_rect.bottom()),
+            Pos2::new(rect.right() - 20.0, rect.bottom()),
+        );
+        let version_response = ui.interact(
+            version_rect,
+            ui.id().with("editorial_version"),
+            Sense::click(),
+        );
+        ui.painter().text(
+            version_rect.left_center(),
+            Align2::LEFT_CENTER,
+            if update_available {
+                "UPDATE AVAILABLE"
+            } else {
+                "EDITION 01 / STABLE"
+            },
+            meta_font(8.5),
+            if update_available {
+                palette.accent
+            } else {
+                palette.muted
+            },
+        );
+        ui.painter().text(
+            version_rect.right_center(),
+            Align2::RIGHT_CENTER,
+            format!("v{LAUNCHER_VERSION}"),
+            meta_font(8.5),
+            palette.muted,
+        );
+        if version_response.clicked() {
+            if update_available {
+                self.launcher_update_prompt_open = true;
+            } else {
+                self.navigate_to(ui.ctx(), Page::Settings, Some(SettingsTab::About));
+            }
+        }
+    }
+
+    fn draw_editorial_home(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, palette.background);
+        let compact = rect.height() < 590.0 || rect.width() < 720.0;
+        let padding = if compact { 24.0 } else { 36.0 };
+        let footer_height = if compact { 112.0 } else { 126.0 };
+        let content = rect.shrink2(Vec2::new(padding, 0.0));
+        let hero = Rect::from_min_max(
+            Pos2::new(
+                content.left(),
+                content.top() + if compact { 20.0 } else { 30.0 },
+            ),
+            Pos2::new(content.right(), content.bottom() - footer_height),
+        );
+        let footer = Rect::from_min_max(
+            Pos2::new(content.left(), hero.bottom()),
+            content.right_bottom(),
+        );
+
+        let selected_name = self
+            .selected_build()
+            .map(|build| build.name.clone())
+            .unwrap_or_else(|| "Сборка не выбрана".into());
+        let figure_visible = hero.width() >= 690.0;
+        let figure_width = if figure_visible {
+            (hero.width() * 0.34).clamp(220.0, 330.0)
+        } else {
+            0.0
+        };
+        let left = Rect::from_min_max(
+            hero.min,
+            Pos2::new(
+                if figure_visible {
+                    hero.right() - figure_width - 34.0
+                } else {
+                    hero.right()
+                },
+                hero.bottom(),
+            ),
+        );
+
+        ui.painter().text(
+            Pos2::new(left.right() - 4.0, left.top() - 20.0),
+            Align2::RIGHT_TOP,
+            "01",
+            display_font((left.height() * 0.42).clamp(104.0, 190.0)),
+            color_with_alpha(palette.text, 0.045),
+        );
+        ui.painter().text(
+            left.left_top(),
+            Align2::LEFT_TOP,
+            "SELECTED BUILD — RELEASE 01",
+            meta_font(10.0),
+            palette.accent,
+        );
+
+        let first_line_y = left.top() + if compact { 46.0 } else { 58.0 };
+        let title_size = if compact { 37.0 } else { 48.0 };
+        let build_size = if compact { 42.0 } else { 56.0 };
+        ui.painter().text(
+            Pos2::new(left.left(), first_line_y),
+            Align2::LEFT_TOP,
+            "Войти в",
+            display_font(title_size),
+            palette.text,
+        );
+        ui.painter().text(
+            Pos2::new(left.left(), first_line_y + title_size + 2.0),
+            Align2::LEFT_TOP,
+            truncate(&selected_name, if compact { 19 } else { 24 }),
+            italic_font(build_size),
+            palette.accent,
+        );
+
+        let dek_y = first_line_y + title_size + build_size + 28.0;
+        ui.painter().text(
+            Pos2::new(left.left(), dek_y),
+            Align2::LEFT_TOP,
+            truncate(&self.status, if compact { 46 } else { 62 }),
+            body_font(if compact { 14.0 } else { 16.0 }),
+            palette.text,
+        );
+        ui.painter().text(
+            Pos2::new(left.left(), dek_y + 28.0),
+            Align2::LEFT_TOP,
+            truncate(&self.detail, if compact { 54 } else { 74 }),
+            body_font(12.0),
+            palette.muted,
+        );
+
+        let byline_y = (left.bottom() - 50.0).max(dek_y + 66.0);
+        ui.painter().line_segment(
+            [
+                Pos2::new(left.left(), byline_y - 13.0),
+                Pos2::new(left.right(), byline_y - 13.0),
+            ],
+            Stroke::new(1.0, palette.border),
+        );
+        ui.painter().text(
+            Pos2::new(left.left(), byline_y),
+            Align2::LEFT_TOP,
+            format!(
+                "PROFILE  {}   /   MEMORY  {} MB",
+                truncate(&self.username.to_uppercase(), 16),
+                self.ram_mb
+            ),
+            meta_font(9.5),
+            palette.muted,
+        );
+
+        if figure_visible {
+            let caption_height = 24.0;
+            let figure = Rect::from_min_max(
+                Pos2::new(hero.right() - figure_width, hero.top()),
+                Pos2::new(hero.right(), hero.bottom() - caption_height),
+            );
+            ui.painter()
+                .rect_filled(figure, CornerRadius::ZERO, palette.code);
+            if let Some(item) = self.gallery.first() {
+                paint_cover(ui.painter(), item.texture.id(), figure, item.aspect);
+            } else {
+                paint_minecraft_placeholder(ui.painter(), figure, palette);
+            }
+            ui.painter().rect_filled(
+                figure,
+                CornerRadius::ZERO,
+                color_with_alpha(palette.background, 0.28),
+            );
+            ui.painter().rect_stroke(
+                figure,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, palette.border),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                figure.left_bottom() + Vec2::new(0.0, 10.0),
+                Align2::LEFT_TOP,
+                "FIG. 01 / WORLD ARCHIVE",
+                meta_font(8.5),
+                palette.muted,
+            );
+            ui.painter().text(
+                figure.right_bottom() + Vec2::new(0.0, 10.0),
+                Align2::RIGHT_TOP,
+                if self.gallery.is_empty() {
+                    "PLACEHOLDER"
+                } else {
+                    "LOCAL"
+                },
+                meta_font(8.5),
+                palette.muted,
+            );
+        }
+
+        ui.painter().line_segment(
+            [footer.left_top(), footer.right_top()],
+            Stroke::new(1.0, palette.border),
+        );
+        if self.busy != Busy::Idle {
+            let fraction = self.editorial_progress_fraction(ui);
+            ui.painter().rect_filled(
+                Rect::from_min_size(footer.min, Vec2::new(footer.width() * fraction, 2.0)),
+                CornerRadius::ZERO,
+                palette.accent,
+            );
+        }
+
+        let info_x = footer.left() + 44.0;
+        ui.painter().text(
+            Pos2::new(footer.left(), footer.top() + 25.0),
+            Align2::LEFT_TOP,
+            "01",
+            meta_font(10.0),
+            palette.muted,
+        );
+        ui.painter().text(
+            Pos2::new(info_x, footer.top() + 20.0),
+            Align2::LEFT_TOP,
+            truncate(&selected_name, 23),
+            display_font(18.0),
+            palette.text,
+        );
+        ui.painter().text(
+            Pos2::new(info_x, footer.top() + 51.0),
+            Align2::LEFT_TOP,
+            if self.busy == Busy::Idle {
+                "SELECTED RELEASE / READY"
+            } else {
+                "INSTALLATION / IN PROGRESS"
+            },
+            meta_font(8.5),
+            palette.muted,
+        );
+
+        let play_width = if compact { 158.0 } else { 190.0 };
+        let play_rect = Rect::from_min_size(
+            Pos2::new(
+                footer.right() - play_width,
+                footer.top() + (footer.height() - 48.0) * 0.5,
+            ),
+            Vec2::new(play_width, 48.0),
+        );
+        let can_play = self.busy == Busy::Idle && !self.builds.is_empty();
+        let can_stop = self.busy == Busy::Installing && !self.cancel.load(Ordering::Relaxed);
+        let button_enabled = can_play || can_stop;
+        let response = ui.interact(
+            play_rect,
+            ui.id().with("editorial_home_play"),
+            if button_enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let (button_fill, button_stroke, button_text) = if !button_enabled {
+            (Color32::TRANSPARENT, palette.border, palette.disabled)
+        } else if can_stop {
+            (
+                if response.hovered() {
+                    palette.danger
+                } else {
+                    Color32::TRANSPARENT
+                },
+                palette.danger,
+                palette.text,
+            )
+        } else if response.hovered() {
+            (palette.text, palette.text, palette.background)
+        } else {
+            (Color32::TRANSPARENT, palette.border, palette.text)
+        };
+        ui.painter()
+            .rect_filled(play_rect, CornerRadius::same(1), button_fill);
+        ui.painter().rect_stroke(
+            play_rect,
+            CornerRadius::same(1),
+            Stroke::new(1.0, button_stroke),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            play_rect.center(),
+            Align2::CENTER_CENTER,
+            match self.busy {
+                Busy::Idle => "ИГРАТЬ  ↗",
+                Busy::LoadingBuilds => "КАТАЛОГ…",
+                Busy::Installing if can_stop => "ОСТАНОВИТЬ  ×",
+                Busy::Installing => "ОСТАНОВКА…",
+                Busy::Launching => "ЗАПУСК…",
+            },
+            meta_font(10.5),
+            button_text,
+        );
+        if can_play && response.clicked() {
+            self.on_play();
+        } else if can_stop && response.clicked() {
+            self.stop_installation();
+        }
+
+        let combo_width = if compact { 146.0 } else { 184.0 };
+        let combo_rect = Rect::from_min_size(
+            Pos2::new(
+                play_rect.left() - combo_width - 16.0,
+                footer.top() + (footer.height() - 38.0) * 0.5,
+            ),
+            Vec2::new(combo_width, 38.0),
+        );
+        let mut requested_build = None;
+        if self.builds.is_empty() {
+            ui.painter().text(
+                combo_rect.center(),
+                Align2::CENTER_CENTER,
+                "НЕТ СБОРОК",
+                meta_font(8.5),
+                palette.muted,
+            );
+        } else {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
+                ui.add_enabled_ui(self.busy == Busy::Idle, |ui| {
+                    let selected = self
+                        .selected_build()
+                        .map(|build| build.name.clone())
+                        .unwrap_or_else(|| "Выберите сборку".into());
+                    egui::ComboBox::from_id_salt("editorial_home_build")
+                        .width(combo_width)
+                        .selected_text(truncate(&selected, 19))
+                        .show_ui(ui, |ui| {
+                            for (index, build) in self.builds.iter().enumerate() {
+                                if ui
+                                    .selectable_label(self.selected_idx == index, &build.name)
+                                    .clicked()
+                                {
+                                    requested_build = Some(index);
+                                }
+                            }
+                        });
+                });
+            });
+        }
+        if let Some(index) = requested_build {
+            self.select_build(index);
+        }
+    }
+
+    fn editorial_progress_fraction(&self, ui: &egui::Ui) -> f32 {
+        match self.busy {
+            Busy::Idle => {
+                if self.builds.is_empty() {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            Busy::LoadingBuilds => {
+                let time = ui.input(|input| input.time) as f32;
+                (0.5 + 0.36 * (time * 1.7).sin()).clamp(0.08, 0.92)
+            }
+            Busy::Installing => {
+                if self.progress_indeterminate {
+                    let time = ui.input(|input| input.time) as f32;
+                    (0.5 + 0.36 * (time * 1.7).sin()).clamp(0.08, 0.92)
+                } else {
+                    self.progress.clamp(0.0, 1.0)
+                }
+            }
+            Busy::Launching => self.progress.max(0.88).clamp(0.0, 1.0),
+        }
+    }
+
     fn draw_skins(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, palette.background);
@@ -1837,13 +2584,20 @@ impl MineLauncherApp {
         ui.painter().text(
             left.left_top(),
             Align2::LEFT_TOP,
-            "Текущий",
-            FontId::proportional(17.0),
+            "Текущий образ",
+            display_font(22.0),
             palette.text,
+        );
+        ui.painter().text(
+            left.left_top() + Vec2::new(0.0, 29.0),
+            Align2::LEFT_TOP,
+            "PROFILE FIGURE / 360°",
+            meta_font(8.5),
+            palette.accent,
         );
 
         let model_rect = Rect::from_min_max(
-            Pos2::new(left.left() + 8.0, left.top() + 34.0),
+            Pos2::new(left.left() + 8.0, left.top() + 52.0),
             Pos2::new(left.right() - 8.0, left.bottom() - 138.0),
         );
         let preview_response = ui
@@ -1870,7 +2624,7 @@ impl MineLauncherApp {
             Pos2::new(left.center().x, model_rect.bottom() + 14.0),
             Align2::CENTER_CENTER,
             "Перетащите модель, чтобы повернуть её на 360°",
-            FontId::proportional(10.5),
+            meta_font(8.5),
             palette.muted,
         );
 
@@ -1879,14 +2633,14 @@ impl MineLauncherApp {
             Pos2::new(left.center().x, profile_y),
             Align2::CENTER_CENTER,
             &account.username,
-            FontId::proportional(14.0),
+            display_font(16.0),
             palette.text,
         );
         ui.painter().text(
             Pos2::new(left.center().x, profile_y + 21.0),
             Align2::CENTER_CENTER,
             "Модель рук",
-            FontId::proportional(11.0),
+            meta_font(8.5),
             palette.muted,
         );
         let model_switch_rect = Rect::from_center_size(
@@ -1914,12 +2668,19 @@ impl MineLauncherApp {
             right.left_top(),
             Align2::LEFT_TOP,
             "Библиотека",
-            FontId::proportional(17.0),
+            display_font(22.0),
             palette.text,
+        );
+        ui.painter().text(
+            right.left_top() + Vec2::new(0.0, 29.0),
+            Align2::LEFT_TOP,
+            "SKIN ARCHIVE / LOCAL",
+            meta_font(8.5),
+            palette.accent,
         );
 
         let new_skin = Rect::from_min_size(
-            Pos2::new(right.left(), right.top() + 42.0),
+            Pos2::new(right.left(), right.top() + 54.0),
             Vec2::new(142.0, 160.0),
         );
         let new_response = ui.interact(new_skin, ui.id().with("new_skin"), Sense::click());
@@ -2064,7 +2825,7 @@ impl MineLauncherApp {
         ctx: &egui::Context,
         palette: Palette,
     ) {
-        let content = rect.shrink2(Vec2::new(26.0, 20.0));
+        let content = rect.shrink2(Vec2::new(32.0, 24.0));
         ui.allocate_new_ui(
             egui::UiBuilder::new()
                 .max_rect(content)
@@ -2073,15 +2834,17 @@ impl MineLauncherApp {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("Галерея")
-                                .size(25.0)
-                                .strong()
+                            RichText::new("Галерея миров")
+                                .font(display_font(28.0))
                                 .color(palette.text),
                         );
                         ui.label(
-                            RichText::new(&self.gallery_status)
-                                .size(12.0)
-                                .color(palette.muted),
+                            RichText::new(format!(
+                                "WORLD ARCHIVE / {}",
+                                self.gallery_status.to_uppercase()
+                            ))
+                            .font(meta_font(9.0))
+                            .color(palette.accent),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2094,7 +2857,9 @@ impl MineLauncherApp {
                         }
                     });
                 });
-                ui.add_space(16.0);
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(18.0);
 
                 if self.gallery.is_empty() {
                     let available = ui.available_size();
@@ -2111,7 +2876,7 @@ impl MineLauncherApp {
                 } else {
                     1
                 };
-                let gap = 14.0;
+                let gap = 18.0;
                 let card_width =
                     ((available_width - gap * (columns as f32 - 1.0)) / columns as f32).max(220.0);
                 egui::ScrollArea::vertical()
@@ -2121,21 +2886,21 @@ impl MineLauncherApp {
                             ui.horizontal_top(|ui| {
                                 for item in row {
                                     Frame::NONE
-                                        .fill(palette.surface)
+                                        .fill(Color32::TRANSPARENT)
                                         .stroke(Stroke::new(1.0, palette.border))
-                                        .corner_radius(10.0)
-                                        .inner_margin(egui::Margin::same(8))
+                                        .corner_radius(0.0)
+                                        .inner_margin(egui::Margin::same(0))
                                         .show(ui, |ui| {
-                                            ui.set_width(card_width - 18.0);
-                                            let image_height = ((card_width - 18.0) / item.aspect)
+                                            ui.set_width(card_width - 2.0);
+                                            let image_height = ((card_width - 2.0) / item.aspect)
                                                 .clamp(145.0, 240.0);
                                             let (image_rect, response) = ui.allocate_exact_size(
-                                                Vec2::new(card_width - 18.0, image_height),
+                                                Vec2::new(card_width - 2.0, image_height),
                                                 Sense::click(),
                                             );
                                             ui.painter().rect_filled(
                                                 image_rect,
-                                                CornerRadius::same(7),
+                                                CornerRadius::ZERO,
                                                 palette.code,
                                             );
                                             paint_cover(
@@ -2144,15 +2909,30 @@ impl MineLauncherApp {
                                                 image_rect,
                                                 item.aspect,
                                             );
+                                            if !response.hovered() {
+                                                ui.painter().rect_filled(
+                                                    image_rect,
+                                                    CornerRadius::ZERO,
+                                                    color_with_alpha(palette.background, 0.22),
+                                                );
+                                            }
                                             if response.double_clicked() {
                                                 let _ = open_path(&item.path);
                                             }
-                                            ui.add_space(4.0);
-                                            ui.label(
-                                                RichText::new(truncate(&item.name, 34))
-                                                    .size(12.0)
-                                                    .color(palette.text),
-                                            );
+                                            ui.add_space(10.0);
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new("FIG.")
+                                                        .font(meta_font(8.5))
+                                                        .color(palette.accent),
+                                                );
+                                                ui.label(
+                                                    RichText::new(truncate(&item.name, 29))
+                                                        .font(display_font(14.0))
+                                                        .color(palette.text),
+                                                );
+                                            });
+                                            ui.add_space(10.0);
                                         });
                                 }
                             });
@@ -2186,7 +2966,7 @@ impl MineLauncherApp {
         );
         ui.painter().circle_filled(
             Pos2::new(top.left() + 13.0, top.center().y),
-            5.0,
+            3.0,
             if self.busy == Busy::Idle {
                 palette.disabled
             } else {
@@ -2201,7 +2981,7 @@ impl MineLauncherApp {
             } else {
                 &self.status
             },
-            FontId::proportional(12.0),
+            meta_font(9.5),
             palette.muted,
         );
 
@@ -2264,7 +3044,7 @@ impl MineLauncherApp {
                 } else {
                     "По этому фильтру ничего не найдено"
                 },
-                FontId::monospace(12.0),
+                meta_font(11.0),
                 palette.muted,
             );
         } else {
@@ -2300,7 +3080,7 @@ impl MineLauncherApp {
             self.selected_build()
                 .map(|build| format!("Сборка: {}", build.name))
                 .unwrap_or_else(|| "Нет данных о сборке".into()),
-            FontId::proportional(10.5),
+            meta_font(8.5),
             palette.muted,
         );
         let ram = if self.busy == Busy::Idle {
@@ -2312,7 +3092,7 @@ impl MineLauncherApp {
             Pos2::new(bottom.right() - 8.0, bottom.center().y),
             Align2::RIGHT_CENTER,
             format!("RAM {ram:.1} GB"),
-            FontId::proportional(10.5),
+            meta_font(8.5),
             palette.muted,
         );
     }
@@ -2326,7 +3106,7 @@ impl MineLauncherApp {
     }
 
     fn draw_general_settings(&mut self, ui: &mut egui::Ui, rect: Rect, palette: Palette) {
-        let content = rect.shrink2(Vec2::new(24.0, 18.0));
+        let content = rect.shrink2(Vec2::new(32.0, 24.0));
         ui.allocate_new_ui(
             egui::UiBuilder::new()
                 .max_rect(content)
@@ -2336,7 +3116,7 @@ impl MineLauncherApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_max_width(840.0);
-                        section_title(ui, "ВНЕШНИЙ ВИД", palette.muted);
+                        section_title(ui, "01 / ВНЕШНИЙ ВИД", palette.accent);
                         ui.label(
                             RichText::new(
                                 "Для части изменений может потребоваться перезапуск лаунчера.",
@@ -2349,20 +3129,20 @@ impl MineLauncherApp {
                             let previous = self.config.theme;
                             egui::ComboBox::from_id_salt("settings_theme")
                                 .selected_text(match self.config.theme {
-                                    Theme::Dark => "Стандартная тёмная",
-                                    Theme::Light => "Светлая",
+                                    Theme::Dark => "Dark editorial",
+                                    Theme::Light => "Paper editorial",
                                 })
                                 .width(220.0)
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut self.config.theme,
                                         Theme::Dark,
-                                        "Стандартная тёмная",
+                                        "Dark editorial",
                                     );
                                     ui.selectable_value(
                                         &mut self.config.theme,
                                         Theme::Light,
-                                        "Светлая",
+                                        "Paper editorial",
                                     );
                                 });
                             if previous != self.config.theme {
@@ -2372,7 +3152,7 @@ impl MineLauncherApp {
                         });
 
                         ui.add_space(22.0);
-                        section_title(ui, "НАСТРОЙКИ JAVA", palette.muted);
+                        section_title(ui, "02 / JAVA И ПАМЯТЬ", palette.accent);
                         let auto_ram_changed = ui
                             .checkbox(&mut self.config.auto_ram, "Автоматическое определение RAM")
                             .on_hover_text("Половина установленной RAM, но не больше 10 ГБ")
@@ -2414,9 +3194,10 @@ impl MineLauncherApp {
                         ui.add_space(10.0);
                         ui.label("Java (версия подбирается по сборке)");
                         ui.horizontal(|ui| {
+                            let input_width = (ui.available_width() - 122.0).max(260.0);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.config.java_path)
-                                    .desired_width(570.0)
+                                    .desired_width(input_width)
                                     .hint_text("Авто: найти или скачать подходящую Java"),
                             );
                             if ui.button("Определить").clicked() {
@@ -2430,7 +3211,7 @@ impl MineLauncherApp {
                         );
 
                         ui.add_space(22.0);
-                        section_title(ui, "СЕРВЕР И SKINSRESTORER", palette.muted);
+                        section_title(ui, "03 / СЕРВЕР И SKINSRESTORER", palette.accent);
                         setting_row(ui, "Адрес сервера:", |ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.config.server_address)
@@ -2448,12 +3229,13 @@ impl MineLauncherApp {
                         );
 
                         ui.add_space(22.0);
-                        section_title(ui, "ХРАНЕНИЕ", palette.muted);
+                        section_title(ui, "04 / ХРАНЕНИЕ", palette.accent);
                         ui.label("Папка архивов и игровых инстансов");
                         ui.horizontal(|ui| {
+                            let input_width = (ui.available_width() - 122.0).max(260.0);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.storage_path_edit)
-                                    .desired_width(570.0),
+                                    .desired_width(input_width),
                             );
                             if ui.button("Выбрать…").clicked() {
                                 if let Some(path) = select_folder() {
@@ -2745,47 +3527,61 @@ impl MineLauncherApp {
         let card = Rect::from_center_size(
             rect.center() - Vec2::new(0.0, 30.0),
             Vec2::new(
-                600.0_f32.min(rect.width() - 48.0),
+                680.0_f32.min(rect.width() - 56.0),
                 430.0_f32.min(rect.height() - 40.0),
             ),
         );
-        ui.painter()
-            .rect_filled(card, CornerRadius::same(14), palette.surface);
-        ui.painter().rect_stroke(
-            card,
-            CornerRadius::same(14),
+        ui.painter().line_segment(
+            [card.left_top(), card.right_top()],
             Stroke::new(1.0, palette.border),
-            egui::StrokeKind::Inside,
         );
-        let logo =
-            Rect::from_center_size(card.center_top() + Vec2::new(0.0, 72.0), Vec2::splat(52.0));
-        draw_logo(ui.painter(), logo);
-        ui.painter().text(
-            card.center_top() + Vec2::new(0.0, 122.0),
-            Align2::CENTER_CENTER,
-            "MineLauncher",
-            FontId::proportional(26.0),
-            palette.text,
+        ui.painter().line_segment(
+            [card.left_bottom(), card.right_bottom()],
+            Stroke::new(1.0, palette.border),
         );
         ui.painter().text(
-            card.center_top() + Vec2::new(0.0, 153.0),
-            Align2::CENTER_CENTER,
-            format!("Версия {LAUNCHER_VERSION} · Rust + egui"),
-            FontId::proportional(13.0),
+            card.left_top() + Vec2::new(0.0, 18.0),
+            Align2::LEFT_TOP,
+            "MASTHEAD / ABOUT",
+            meta_font(9.0),
+            palette.accent,
+        );
+        ui.painter().text(
+            card.right_top() + Vec2::new(0.0, 18.0),
+            Align2::RIGHT_TOP,
+            "EDITION 01",
+            meta_font(9.0),
             palette.muted,
         );
+        let logo =
+            Rect::from_center_size(card.center_top() + Vec2::new(0.0, 80.0), Vec2::splat(42.0));
+        draw_logo(ui.painter(), logo);
         ui.painter().text(
-            card.center_top() + Vec2::new(0.0, 205.0),
+            card.center_top() + Vec2::new(0.0, 132.0),
             Align2::CENTER_CENTER,
-            "Лаунчер для приватной Minecraft-сборки",
-            FontId::proportional(15.0),
+            "MineLauncher",
+            display_font(38.0),
             palette.text,
         );
         ui.painter().text(
-            card.center_top() + Vec2::new(0.0, 234.0),
+            card.center_top() + Vec2::new(0.0, 171.0),
+            Align2::CENTER_CENTER,
+            format!("VERSION {LAUNCHER_VERSION} / RUST + EGUI"),
+            meta_font(9.5),
+            palette.accent,
+        );
+        ui.painter().text(
+            card.center_top() + Vec2::new(0.0, 218.0),
+            Align2::CENTER_CENTER,
+            "Лаунчер для приватной Minecraft-сборки",
+            italic_font(18.0),
+            palette.text,
+        );
+        ui.painter().text(
+            card.center_top() + Vec2::new(0.0, 252.0),
             Align2::CENTER_CENTER,
             "Сборки Google Drive · NeoForge · офлайн-профили · синхронизация скинов",
-            FontId::proportional(12.0),
+            body_font(12.0),
             palette.muted,
         );
         let state = self.launcher_update.clone();
@@ -3070,7 +3866,7 @@ impl eframe::App for MineLauncherApp {
 
         egui::CentralPanel::default()
             .frame(Frame::NONE)
-            .show(ctx, |ui| self.draw_shell(ui, ctx));
+            .show(ctx, |ui| self.draw_editorial_shell(ui, ctx));
         self.draw_launcher_update_dialog(ctx, Palette::for_theme(self.config.theme));
         updater::mark_startup_healthy();
     }
@@ -3276,14 +4072,19 @@ fn display_builds_root(config: &Config) -> String {
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str, color: Color32) {
-    ui.label(RichText::new(title).size(11.0).strong().color(color));
-    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(7.0);
+    ui.label(RichText::new(title).font(meta_font(9.5)).color(color));
+    ui.add_space(8.0);
 }
 
 fn setting_row(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.set_min_height(40.0);
-        ui.add_sized(Vec2::new(108.0, 34.0), egui::Label::new(label));
+        ui.add_sized(
+            Vec2::new(128.0, 34.0),
+            egui::Label::new(RichText::new(label).font(meta_font(9.5))),
+        );
         content(ui);
     });
 }
@@ -3350,14 +4151,16 @@ fn account_profile_card(
         0.12,
     );
     let fill = if hover_t > 0.0 {
-        mix_color(palette.surface, palette.progress_track, hover_t * 0.72)
+        color_with_alpha(palette.sidebar_selected, 0.62 * hover_t)
+    } else if active {
+        color_with_alpha(palette.sidebar_selected, 0.45)
     } else {
-        palette.surface
+        Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
     ui.painter().rect_stroke(
         rect,
-        CornerRadius::same(10),
+        CornerRadius::ZERO,
         Stroke::new(
             if active { 2.0 } else { 1.0 },
             if active {
@@ -3377,7 +4180,7 @@ fn account_profile_card(
         Pos2::new(text_x, rect.center().y - 10.0),
         Align2::LEFT_CENTER,
         truncate(&account.username, 25),
-        FontId::proportional(16.5),
+        display_font(17.0),
         palette.text,
     );
     let status_color = if active {
@@ -3404,17 +4207,17 @@ fn account_profile_card(
         } else {
             "Офлайн · скин настроен"
         },
-        FontId::proportional(11.5),
+        meta_font(8.5),
         status_color,
     );
 
     if edit_response.hovered() {
         ui.painter()
-            .rect_filled(edit_rect, CornerRadius::same(6), palette.progress_track);
+            .rect_filled(edit_rect, CornerRadius::ZERO, palette.progress_track);
     }
     if delete_response.hovered() && can_delete {
         ui.painter()
-            .rect_filled(delete_rect, CornerRadius::same(6), palette.progress_track);
+            .rect_filled(delete_rect, CornerRadius::ZERO, palette.progress_track);
     }
     draw_pencil_icon(
         ui.painter(),
@@ -3462,7 +4265,7 @@ fn add_account_button(ui: &mut egui::Ui, palette: Palette) -> egui::Response {
     if response.hovered() {
         ui.painter().rect_filled(
             button_rect,
-            CornerRadius::same(8),
+            CornerRadius::ZERO,
             color_with_alpha(palette.accent, 0.08),
         );
     }
@@ -3548,7 +4351,7 @@ fn draw_account_avatar(
     skin_texture: egui::TextureId,
     palette: Palette,
 ) {
-    painter.rect_filled(rect, CornerRadius::same(4), palette.progress_track);
+    painter.rect_filled(rect, CornerRadius::ZERO, palette.progress_track);
     let face_size = (((rect.width().min(rect.height()) - 4.0) / 8.0).floor() * 8.0).max(8.0);
     let face = Rect::from_center_size(rect.center(), Vec2::splat(face_size));
     let base_uv = Rect::from_min_max(
@@ -3563,12 +4366,222 @@ fn draw_account_avatar(
     painter.image(skin_texture, face, overlay_uv, Color32::WHITE);
     painter.rect_stroke(
         rect,
-        CornerRadius::same(4),
+        CornerRadius::ZERO,
         Stroke::new(1.0, palette.border),
         egui::StrokeKind::Inside,
     );
 }
 
+fn editorial_top_tab(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    label: &str,
+    selected: bool,
+    palette: Palette,
+) -> egui::Response {
+    let id = ui.id().with(("editorial_top_tab", label));
+    let response = ui.interact(rect, id, Sense::click());
+    let hovered = response.hovered();
+    let color = if selected {
+        palette.accent
+    } else if hovered {
+        palette.text
+    } else {
+        palette.muted
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        meta_font(9.5),
+        color,
+    );
+    let underline_t =
+        ui.ctx()
+            .animate_bool_with_time(id.with("underline"), selected || hovered, 0.16);
+    if underline_t > 0.0 {
+        let width = (rect.width() - 24.0).max(18.0) * underline_t;
+        ui.painter().rect_filled(
+            Rect::from_center_size(
+                Pos2::new(rect.center().x, rect.bottom() - 1.0),
+                Vec2::new(width, 1.0),
+            ),
+            CornerRadius::ZERO,
+            if selected {
+                palette.accent
+            } else {
+                palette.text
+            },
+        );
+    }
+    response
+}
+
+fn editorial_side_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    rect: Rect,
+    index: &str,
+    label: &str,
+    selected: bool,
+    enabled: bool,
+    palette: Palette,
+) -> egui::Response {
+    let id = ui.id().with(("editorial_side", id_source));
+    let response = ui.interact(
+        rect,
+        id,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let hover_t =
+        ui.ctx()
+            .animate_bool_with_time(id.with("hover"), enabled && response.hovered(), 0.14);
+    let selected_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("selected"), selected, 0.18);
+
+    ui.painter().line_segment(
+        [rect.left_top(), rect.right_top()],
+        Stroke::new(1.0, palette.border),
+    );
+    if selected_t > 0.0 || hover_t > 0.0 {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::ZERO,
+            color_with_alpha(
+                palette.sidebar_selected,
+                (selected_t * 0.74 + hover_t * 0.42).clamp(0.0, 0.8),
+            ),
+        );
+    }
+    if selected_t > 0.0 {
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height())),
+            CornerRadius::ZERO,
+            color_with_alpha(palette.accent, selected_t),
+        );
+    }
+
+    let offset = 7.0 * hover_t;
+    let number_color = if selected || response.hovered() {
+        palette.accent
+    } else {
+        palette.muted
+    };
+    let label_color = if !enabled {
+        palette.disabled
+    } else if selected {
+        palette.accent_text
+    } else if response.hovered() {
+        palette.text
+    } else {
+        palette.muted
+    };
+    ui.painter().text(
+        Pos2::new(rect.left() + 19.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        index,
+        meta_font(9.0),
+        number_color,
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 52.0 + offset, rect.center().y - 1.0),
+        Align2::LEFT_CENTER,
+        truncate(label, 19),
+        display_font(15.0),
+        label_color,
+    );
+    if enabled && (selected || response.hovered()) {
+        ui.painter().text(
+            Pos2::new(rect.right() - 18.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            "→",
+            meta_font(11.0),
+            palette.accent,
+        );
+    }
+    response
+}
+
+fn draw_editorial_instrument(
+    ui: &egui::Ui,
+    rect: Rect,
+    fraction: f32,
+    busy: Busy,
+    palette: Palette,
+) {
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.background);
+    ui.painter().line_segment(
+        [rect.left_top(), rect.left_bottom()],
+        Stroke::new(1.0, palette.border),
+    );
+    let track = Rect::from_min_max(
+        Pos2::new(rect.center().x, rect.top() + 30.0),
+        Pos2::new(rect.center().x + 1.0, rect.bottom() - 70.0),
+    );
+    ui.painter()
+        .rect_filled(track, CornerRadius::ZERO, palette.border);
+    let fraction = fraction.clamp(0.0, 1.0);
+    let fill = Rect::from_min_max(
+        Pos2::new(track.left(), track.bottom() - track.height() * fraction),
+        track.right_bottom(),
+    );
+    ui.painter()
+        .rect_filled(fill, CornerRadius::ZERO, palette.accent);
+    for tick in 0..=4 {
+        let y = track.top() + track.height() * tick as f32 / 4.0;
+        ui.painter().line_segment(
+            [
+                Pos2::new(track.left() - 3.0, y),
+                Pos2::new(track.right() + 3.0, y),
+            ],
+            Stroke::new(1.0, color_with_alpha(palette.muted, 0.45)),
+        );
+    }
+    ui.painter().text(
+        Pos2::new(rect.center().x, rect.bottom() - 44.0),
+        Align2::CENTER_CENTER,
+        format!("{:03}", (fraction * 100.0).round() as u32),
+        meta_font(9.5),
+        palette.accent,
+    );
+    ui.painter().text(
+        Pos2::new(rect.center().x, rect.bottom() - 25.0),
+        Align2::CENTER_CENTER,
+        match busy {
+            Busy::Idle => "READY",
+            Busy::LoadingBuilds => "INDEX",
+            Busy::Installing => "LOAD",
+            Busy::Launching => "BOOT",
+        },
+        meta_font(7.5),
+        palette.muted,
+    );
+}
+
+fn draw_editorial_grain(painter: &egui::Painter, rect: Rect, palette: Palette) {
+    let mut state = 0xA17E_5EED_u32;
+    let count = ((rect.width() * rect.height()) / 14_000.0).clamp(28.0, 92.0) as usize;
+    let color = color_with_alpha(palette.text, 0.025);
+    for _ in 0..count {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let x = rect.left() + (state as f32 / u32::MAX as f32) * rect.width();
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let y = rect.top() + (state as f32 / u32::MAX as f32) * rect.height();
+        painter.rect_filled(
+            Rect::from_min_size(Pos2::new(x, y), Vec2::splat(1.0)),
+            CornerRadius::ZERO,
+            color,
+        );
+    }
+}
+
+#[allow(dead_code)]
 fn top_tab(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -3592,6 +4605,7 @@ fn top_tab(
     response
 }
 
+#[allow(dead_code)]
 fn animated_tab_indicator(
     ui: &mut egui::Ui,
     id_source: &'static str,
@@ -3621,6 +4635,7 @@ fn animated_tab_indicator(
         .rect_filled(indicator, CornerRadius::same(2), palette.accent);
 }
 
+#[allow(dead_code)]
 fn side_button(
     ui: &mut egui::Ui,
     id_source: impl std::hash::Hash,
@@ -3709,42 +4724,38 @@ fn color_with_alpha(color: Color32, opacity: f32) -> Color32 {
     )
 }
 
-fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
-    let amount = amount.clamp(0.0, 1.0);
-    let channel =
-        |start: u8, end: u8| (start as f32 + (end as f32 - start as f32) * amount).round() as u8;
-    Color32::from_rgba_unmultiplied(
-        channel(from.r(), to.r()),
-        channel(from.g(), to.g()),
-        channel(from.b(), to.b()),
-        channel(from.a(), to.a()),
-    )
-}
-
 fn draw_logo(painter: &egui::Painter, rect: Rect) {
-    let half = rect.size() / 2.0;
-    painter.rect_filled(
-        Rect::from_min_size(rect.min, half),
-        CornerRadius::same(2),
-        Color32::from_rgb(255, 87, 89),
+    let brass = Color32::from_rgb(171, 133, 82);
+    let hairline = Color32::from_rgb(72, 68, 61);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, brass),
+        egui::StrokeKind::Inside,
     );
-    painter.rect_filled(
-        Rect::from_min_size(rect.min + Vec2::new(half.x, 0.0), half),
-        CornerRadius::same(2),
-        Color32::from_rgb(246, 167, 58),
+    painter.circle_stroke(
+        rect.center(),
+        rect.width().min(rect.height()) * 0.27,
+        Stroke::new(1.0, hairline),
     );
-    painter.rect_filled(
-        Rect::from_min_size(rect.min + Vec2::new(0.0, half.y), half),
-        CornerRadius::same(2),
-        Color32::from_rgb(110, 80, 235),
+    painter.line_segment(
+        [
+            Pos2::new(rect.left(), rect.center().y),
+            Pos2::new(rect.right(), rect.center().y),
+        ],
+        Stroke::new(1.0, hairline),
     );
-    painter.rect_filled(
-        Rect::from_min_size(rect.min + half, half),
-        CornerRadius::same(2),
-        Color32::from_rgb(61, 198, 147),
+    painter.line_segment(
+        [
+            Pos2::new(rect.center().x, rect.top()),
+            Pos2::new(rect.center().x, rect.bottom()),
+        ],
+        Stroke::new(1.0, hairline),
     );
+    painter.circle_filled(rect.center(), 2.5, brass);
 }
 
+#[allow(dead_code)]
 fn draw_build_icon(painter: &egui::Painter, rect: Rect, palette: Palette) {
     painter.rect_filled(rect, CornerRadius::same(7), palette.code);
     painter.rect_stroke(
@@ -4488,6 +5499,7 @@ fn select_skin_file() -> Option<PathBuf> {
     (output.status.success() && !selected.is_empty()).then(|| PathBuf::from(selected))
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Palette {
     background: Color32,
@@ -4515,62 +5527,142 @@ impl Palette {
     fn for_theme(theme: Theme) -> Self {
         match theme {
             Theme::Dark => Self {
-                background: Color32::from_rgb(23, 24, 24),
-                titlebar: Color32::from_rgb(18, 19, 19),
-                sidebar: Color32::from_rgb(18, 19, 19),
-                sidebar_profile: Color32::from_rgb(25, 26, 26),
-                sidebar_selected: Color32::from_rgb(24, 46, 38),
-                surface: Color32::from_rgb(28, 29, 29),
-                border: Color32::from_rgb(48, 50, 50),
-                text: Color32::from_rgb(242, 244, 243),
-                muted: Color32::from_rgb(136, 143, 141),
-                disabled: Color32::from_rgb(60, 63, 62),
-                accent: Color32::from_rgb(42, 188, 128),
-                accent_hover: Color32::from_rgb(49, 211, 143),
-                accent_dim: Color32::from_rgb(41, 109, 83),
-                accent_text: Color32::from_rgb(82, 222, 161),
-                danger: Color32::from_rgb(212, 76, 80),
-                progress_track: Color32::from_rgb(49, 54, 52),
-                code: Color32::from_rgb(17, 19, 18),
-                console: Color32::from_rgb(11, 13, 12),
-                console_text: Color32::from_rgb(196, 208, 201),
+                background: Color32::from_rgb(13, 13, 15),
+                titlebar: Color32::from_rgb(13, 13, 15),
+                sidebar: Color32::from_rgb(13, 13, 15),
+                sidebar_profile: Color32::from_rgb(18, 18, 20),
+                sidebar_selected: Color32::from_rgb(23, 23, 26),
+                surface: Color32::from_rgb(23, 23, 26),
+                border: Color32::from_rgb(38, 38, 42),
+                text: Color32::from_rgb(236, 231, 221),
+                muted: Color32::from_rgb(138, 135, 128),
+                disabled: Color32::from_rgb(55, 54, 51),
+                accent: Color32::from_rgb(171, 133, 82),
+                accent_hover: Color32::from_rgb(199, 160, 105),
+                accent_dim: Color32::from_rgb(82, 66, 47),
+                accent_text: Color32::from_rgb(202, 164, 112),
+                danger: Color32::from_rgb(122, 59, 52),
+                progress_track: Color32::from_rgb(38, 38, 42),
+                code: Color32::from_rgb(18, 18, 20),
+                console: Color32::from_rgb(9, 9, 11),
+                console_text: Color32::from_rgb(205, 199, 187),
             },
             Theme::Light => Self {
-                background: Color32::from_rgb(238, 241, 240),
-                titlebar: Color32::from_rgb(255, 255, 255),
-                sidebar: Color32::from_rgb(248, 249, 249),
-                sidebar_profile: Color32::from_rgb(255, 255, 255),
-                sidebar_selected: Color32::from_rgb(218, 241, 232),
-                surface: Color32::from_rgb(255, 255, 255),
-                border: Color32::from_rgb(210, 216, 213),
-                text: Color32::from_rgb(29, 35, 32),
-                muted: Color32::from_rgb(103, 113, 108),
-                disabled: Color32::from_rgb(211, 216, 214),
-                accent: Color32::from_rgb(28, 154, 97),
-                accent_hover: Color32::from_rgb(34, 177, 111),
-                accent_dim: Color32::from_rgb(139, 205, 174),
-                accent_text: Color32::from_rgb(17, 125, 77),
-                danger: Color32::from_rgb(196, 61, 67),
-                progress_track: Color32::from_rgb(207, 216, 212),
-                code: Color32::from_rgb(235, 240, 237),
-                console: Color32::from_rgb(25, 29, 27),
-                console_text: Color32::from_rgb(215, 225, 219),
+                background: Color32::from_rgb(236, 231, 221),
+                titlebar: Color32::from_rgb(244, 239, 229),
+                sidebar: Color32::from_rgb(230, 224, 212),
+                sidebar_profile: Color32::from_rgb(244, 239, 229),
+                sidebar_selected: Color32::from_rgb(222, 207, 186),
+                surface: Color32::from_rgb(244, 239, 229),
+                border: Color32::from_rgb(199, 190, 174),
+                text: Color32::from_rgb(27, 26, 24),
+                muted: Color32::from_rgb(111, 106, 99),
+                disabled: Color32::from_rgb(201, 194, 181),
+                accent: Color32::from_rgb(140, 97, 59),
+                accent_hover: Color32::from_rgb(112, 74, 43),
+                accent_dim: Color32::from_rgb(205, 184, 157),
+                accent_text: Color32::from_rgb(117, 78, 46),
+                danger: Color32::from_rgb(122, 59, 52),
+                progress_track: Color32::from_rgb(208, 199, 184),
+                code: Color32::from_rgb(225, 218, 205),
+                console: Color32::from_rgb(18, 18, 20),
+                console_text: Color32::from_rgb(225, 219, 207),
             },
         }
     }
 }
 
+fn install_editorial_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    let windows_fonts = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+
+    if let Ok(bytes) = std::fs::read(windows_fonts.join("segoeui.ttf")) {
+        let key = "editorial_body_data".to_owned();
+        fonts
+            .font_data
+            .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, key);
+    }
+    let body_chain = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    fonts
+        .families
+        .insert(FontFamily::Name(BODY_FONT_FAMILY.into()), body_chain);
+
+    if let Ok(bytes) = std::fs::read(windows_fonts.join("consola.ttf")) {
+        let key = "editorial_meta_data".to_owned();
+        fonts
+            .font_data
+            .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, key);
+    }
+    let mono_chain = fonts
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    fonts
+        .families
+        .insert(FontFamily::Name(META_FONT_FAMILY.into()), mono_chain);
+
+    for (family, key, file_name) in [
+        (DISPLAY_FONT_FAMILY, "editorial_display_data", "georgia.ttf"),
+        (ITALIC_FONT_FAMILY, "editorial_italic_data", "georgiai.ttf"),
+    ] {
+        let mut chain = Vec::new();
+        if let Ok(bytes) = std::fs::read(windows_fonts.join(file_name)) {
+            fonts
+                .font_data
+                .insert(key.to_owned(), Arc::new(FontData::from_owned(bytes)));
+            chain.push(key.to_owned());
+        }
+        chain.extend(
+            fonts
+                .families
+                .get(&FontFamily::Proportional)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        fonts
+            .families
+            .insert(FontFamily::Name(family.into()), chain);
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 fn configure_style(ctx: &egui::Context, theme: Theme) {
     let palette = Palette::for_theme(theme);
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(9.0, 8.0);
-    style.spacing.button_padding = Vec2::new(12.0, 7.0);
+    style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+    style.spacing.button_padding = Vec2::new(14.0, 8.0);
+    style.spacing.interact_size.y = 38.0;
     style
         .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+        .insert(egui::TextStyle::Body, body_font(14.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(13.5));
+        .insert(egui::TextStyle::Button, meta_font(12.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, display_font(24.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Monospace, meta_font(12.0));
     ctx.set_style(style);
 
     let mut visuals = match theme {
@@ -4580,17 +5672,27 @@ fn configure_style(ctx: &egui::Context, theme: Theme) {
     visuals.override_text_color = Some(palette.text);
     visuals.panel_fill = palette.background;
     visuals.window_fill = palette.surface;
+    visuals.window_stroke = Stroke::new(1.0, palette.border);
+    visuals.window_corner_radius = CornerRadius::same(2);
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow::NONE;
     visuals.extreme_bg_color = palette.code;
     visuals.faint_bg_color = palette.surface;
     visuals.widgets.inactive.bg_fill = palette.surface;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette.border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
-    visuals.widgets.hovered.bg_fill = palette.progress_track;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.accent_dim);
-    visuals.widgets.active.bg_fill = palette.accent;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.selection.bg_fill = palette.accent;
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(1);
+    visuals.widgets.hovered.bg_fill = palette.sidebar_selected;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.accent);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(1);
+    visuals.widgets.active.bg_fill = palette.accent_dim;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, palette.accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
+    visuals.widgets.active.corner_radius = CornerRadius::same(1);
+    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(1);
+    visuals.selection.bg_fill = palette.accent_dim;
+    visuals.selection.stroke = Stroke::new(1.0, palette.accent);
     ctx.set_visuals(visuals);
 }
 
@@ -4628,5 +5730,25 @@ mod tests {
         assert_eq!(uvs.front, [44.0, 20.0, 47.0, 32.0]);
         assert_eq!(uvs.positive_x, [47.0, 20.0, 51.0, 32.0]);
         assert_eq!(uvs.back, [51.0, 20.0, 54.0, 32.0]);
+    }
+
+    #[test]
+    fn editorial_layout_fits_minimum_window() {
+        let layout = editorial_layout(Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 620.0)));
+        assert_eq!(layout.masthead.height(), 64.0);
+        assert_eq!(layout.sidebar.width(), 224.0);
+        assert_eq!(layout.content.width(), 736.0);
+        assert_eq!(layout.content.height(), 556.0);
+        assert!(layout.instrument.is_none());
+    }
+
+    #[test]
+    fn editorial_layout_reserves_wide_screen_instrument() {
+        let layout = editorial_layout(Rect::from_min_size(Pos2::ZERO, Vec2::new(1240.0, 760.0)));
+        assert_eq!(layout.masthead.height(), 72.0);
+        assert_eq!(layout.sidebar.width(), 252.0);
+        assert_eq!(layout.content.width(), 934.0);
+        assert_eq!(layout.content.height(), 688.0);
+        assert_eq!(layout.instrument.map(|rect| rect.width()), Some(54.0));
     }
 }
