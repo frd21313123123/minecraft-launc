@@ -1844,7 +1844,7 @@ impl MineLauncherApp {
 
         let model_rect = Rect::from_min_max(
             Pos2::new(left.left() + 8.0, left.top() + 34.0),
-            Pos2::new(left.right() - 8.0, left.bottom() - 106.0),
+            Pos2::new(left.right() - 8.0, left.bottom() - 138.0),
         );
         let preview_response = ui
             .interact(
@@ -1874,7 +1874,7 @@ impl MineLauncherApp {
             palette.muted,
         );
 
-        let profile_y = left.bottom() - 55.0;
+        let profile_y = left.bottom() - 104.0;
         ui.painter().text(
             Pos2::new(left.center().x, profile_y),
             Align2::CENTER_CENTER,
@@ -1885,13 +1885,30 @@ impl MineLauncherApp {
         ui.painter().text(
             Pos2::new(left.center().x, profile_y + 21.0),
             Align2::CENTER_CENTER,
-            match account.skin_model {
-                SkinModel::Classic => "Classic",
-                SkinModel::Slim => "Slim",
-            },
-            FontId::proportional(12.0),
+            "Модель рук",
+            FontId::proportional(11.0),
             palette.muted,
         );
+        let model_switch_rect = Rect::from_center_size(
+            Pos2::new(left.center().x, profile_y + 46.0),
+            Vec2::new(left.width() - 16.0, 30.0),
+        );
+        let mut selected_model = account.skin_model;
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(model_switch_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                skin_model_buttons(ui, &mut selected_model);
+            },
+        );
+        if selected_model != account.skin_model {
+            if let Some(active) = self.config.accounts.get_mut(self.config.active_account) {
+                active.skin_model = selected_model;
+            }
+            let _ = self.config.save();
+            self.account_message = format!("Выбрана модель: {}", selected_model.label());
+        }
 
         ui.painter().text(
             right.left_top(),
@@ -1978,21 +1995,8 @@ impl MineLauncherApp {
                         browse_clicked = ui.button("Обзор…").clicked();
                     });
                     ui.add_space(8.0);
-                    egui::ComboBox::from_id_salt("skin_library_model")
-                        .selected_text(self.skin_model_draft.label())
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.skin_model_draft,
-                                SkinModel::Classic,
-                                SkinModel::Classic.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.skin_model_draft,
-                                SkinModel::Slim,
-                                SkinModel::Slim.label(),
-                            );
-                        });
+                    ui.label(RichText::new("Модель рук").strong());
+                    skin_model_buttons(ui, &mut self.skin_model_draft);
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(
@@ -2649,21 +2653,7 @@ impl MineLauncherApp {
 
                 ui.add_space(10.0);
                 ui.label(RichText::new("Модель скина").strong());
-                egui::ComboBox::from_id_salt("account_skin_model")
-                    .selected_text(self.account_draft.skin_model.label())
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.account_draft.skin_model,
-                            SkinModel::Classic,
-                            SkinModel::Classic.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.account_draft.skin_model,
-                            SkinModel::Slim,
-                            SkinModel::Slim.label(),
-                        );
-                    });
+                skin_model_buttons(ui, &mut self.account_draft.skin_model);
 
                 if !self.account_message.is_empty() {
                     ui.add_space(9.0);
@@ -3172,6 +3162,26 @@ fn empty_account() -> AccountConfig {
         skin_source: String::new(),
         skin_model: SkinModel::Classic,
     }
+}
+
+/// Shows the Minecraft arm model choice as an immediately recognisable pair of buttons.
+fn skin_model_buttons(ui: &mut egui::Ui, model: &mut SkinModel) {
+    let available_width = ui.available_width();
+    let button_width = ((available_width - ui.spacing().item_spacing.x) / 2.0).max(90.0);
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [button_width, 28.0],
+            egui::Button::new("Steve · широкие").selected(*model == SkinModel::Classic),
+        )
+        .clicked()
+        .then(|| *model = SkinModel::Classic);
+        ui.add_sized(
+            [button_width, 28.0],
+            egui::Button::new("Alex · тонкие").selected(*model == SkinModel::Slim),
+        )
+        .clicked()
+        .then(|| *model = SkinModel::Slim);
+    });
 }
 
 fn is_local_skin_source(source: &str) -> bool {
