@@ -1260,7 +1260,6 @@ impl MineLauncherApp {
     fn draw_shell(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let palette = Palette::for_theme(self.config.theme);
         let full = ui.max_rect();
-        let title_height = 36.0;
         let sidebar_width = 232.0_f32.min(full.width() * 0.27);
         let nav_height_target: f32 = if self.page == Page::Console {
             0.0
@@ -1273,31 +1272,14 @@ impl MineLauncherApp {
         ui.painter()
             .rect_filled(full, CornerRadius::ZERO, palette.background);
 
-        let title = Rect::from_min_size(full.min, Vec2::new(full.width(), title_height));
-        ui.painter()
-            .rect_filled(title, CornerRadius::ZERO, palette.titlebar);
-        ui.painter().line_segment(
-            [title.left_bottom(), title.right_bottom()],
-            Stroke::new(1.0, palette.border),
-        );
-        let logo = Rect::from_min_size(title.min + Vec2::new(10.0, 10.0), Vec2::new(14.0, 14.0));
-        draw_logo(ui.painter(), logo);
-        ui.painter().text(
-            Pos2::new(33.0, title.center().y),
-            Align2::LEFT_CENTER,
-            "MineLauncher Beta",
-            FontId::proportional(13.0),
-            palette.text,
-        );
-
         let sidebar = Rect::from_min_max(
-            Pos2::new(full.left(), title.bottom()),
+            full.left_top(),
             Pos2::new(full.left() + sidebar_width, full.bottom()),
         );
         self.draw_sidebar(ui, sidebar, palette);
 
         let main = Rect::from_min_max(
-            Pos2::new(sidebar.right(), title.bottom()),
+            sidebar.right_top(),
             full.right_bottom(),
         );
         let top_nav = Rect::from_min_size(
