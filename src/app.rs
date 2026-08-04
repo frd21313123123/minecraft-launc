@@ -146,6 +146,7 @@ pub struct MineLauncherApp {
     game_log: String,
     console_filter: String,
     last_log_refresh: Instant,
+    skin_preview_yaw: f32,
     skin_editor_open: bool,
     skin_source_draft: String,
     skin_model_draft: SkinModel,
@@ -215,6 +216,7 @@ impl MineLauncherApp {
             game_log: String::new(),
             console_filter: String::new(),
             last_log_refresh: Instant::now() - Duration::from_secs(5),
+            skin_preview_yaw: 0.45,
             skin_editor_open: false,
             skin_source_draft: String::new(),
             skin_model_draft: SkinModel::Classic,
@@ -1568,14 +1570,6 @@ impl MineLauncherApp {
 
         let mut x = rect.left() + 24.0;
         if self.page == Page::Settings {
-            ui.painter().text(
-                Pos2::new(x, rect.center().y),
-                Align2::LEFT_CENTER,
-                "‹",
-                FontId::proportional(22.0),
-                palette.muted,
-            );
-            x += 22.0;
             let mut active_rect = None;
             for (tab, label, width) in [
                 (SettingsTab::General, "Основное", 94.0),
@@ -1739,7 +1733,15 @@ impl MineLauncherApp {
         let can_play = self.busy == Busy::Idle && !self.builds.is_empty();
         let can_stop = self.busy == Busy::Installing && !self.cancel.load(Ordering::Relaxed);
         let button_enabled = can_play || can_stop;
-        let play_response = ui.interact(play_rect, ui.id().with("home_play"), Sense::click());
+        let play_response = ui.interact(
+            play_rect,
+            ui.id().with("home_play"),
+            if button_enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
         let play_color = if !button_enabled {
             palette.disabled
         } else if can_stop {
@@ -1783,35 +1785,45 @@ impl MineLauncherApp {
             Vec2::new(combo_width, 34.0),
         );
         let mut requested_build = None;
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
-            ui.add_enabled_ui(self.busy == Busy::Idle, |ui| {
-                let selected = self
-                    .selected_build()
-                    .map(|build| build.name.clone())
-                    .unwrap_or_else(|| "Нет сборок".into());
-                egui::ComboBox::from_id_salt("home_build")
-                    .width(combo_width)
-                    .selected_text(truncate(&selected, 22))
-                    .show_ui(ui, |ui| {
-                        for (index, build) in self.builds.iter().enumerate() {
-                            let suffix = if drive::is_build_installed(&build.id) {
-                                " · установлено"
-                            } else {
-                                ""
-                            };
-                            if ui
-                                .selectable_label(
-                                    self.selected_idx == index,
-                                    format!("{}{suffix}", build.name),
-                                )
-                                .clicked()
-                            {
-                                requested_build = Some(index);
+        if self.builds.is_empty() {
+            ui.painter().text(
+                combo_rect.center(),
+                Align2::CENTER_CENTER,
+                "Нет доступных сборок",
+                FontId::proportional(12.0),
+                palette.muted,
+            );
+        } else {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
+                ui.add_enabled_ui(self.busy == Busy::Idle, |ui| {
+                    let selected = self
+                        .selected_build()
+                        .map(|build| build.name.clone())
+                        .unwrap_or_else(|| "Выберите сборку".into());
+                    egui::ComboBox::from_id_salt("home_build")
+                        .width(combo_width)
+                        .selected_text(truncate(&selected, 22))
+                        .show_ui(ui, |ui| {
+                            for (index, build) in self.builds.iter().enumerate() {
+                                let suffix = if drive::is_build_installed(&build.id) {
+                                    " · установлено"
+                                } else {
+                                    ""
+                                };
+                                if ui
+                                    .selectable_label(
+                                        self.selected_idx == index,
+                                        format!("{}{suffix}", build.name),
+                                    )
+                                    .clicked()
+                                {
+                                    requested_build = Some(index);
+                                }
                             }
-                        }
-                    });
+                        });
+                });
             });
-        });
+        }
         if let Some(index) = requested_build {
             self.select_build(index);
         }
@@ -1847,24 +1859,40 @@ impl MineLauncherApp {
             FontId::proportional(17.0),
             palette.text,
         );
-        draw_eye_icon(
-            ui.painter(),
-            Pos2::new(left.right() - 42.0, left.top() + 10.0),
-            palette.muted,
+
+        let model_rect = Rect::from_min_max(
+            Pos2::new(left.left() + 8.0, left.top() + 34.0),
+            Pos2::new(left.right() - 8.0, left.bottom() - 106.0),
         );
-        draw_shirt_icon(
-            ui.painter(),
-            Pos2::new(left.right() - 10.0, left.top() + 10.0),
+        let preview_response = ui
+            .interact(
+                model_rect,
+                ui.id().with("skin_preview_rotation"),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Grab);
+        if preview_response.dragged() {
+            let drag_x = ui.input(|input| input.pointer.delta().x);
+            self.skin_preview_yaw = normalize_skin_yaw(self.skin_preview_yaw + drag_x * 0.012);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        draw_skin_avatar_3d(
+            &ui.painter().with_clip_rect(model_rect),
+            skin_texture,
+            model_rect,
+            account.skin_model,
+            self.skin_preview_yaw,
+            palette,
+        );
+        ui.painter().text(
+            Pos2::new(left.center().x, model_rect.bottom() + 14.0),
+            Align2::CENTER_CENTER,
+            "Перетащите модель, чтобы повернуть её на 360°",
+            FontId::proportional(10.5),
             palette.muted,
         );
 
-        let model_rect = Rect::from_center_size(
-            Pos2::new(left.center().x, left.center().y - 38.0),
-            Vec2::new(left.width() * 0.78, (left.height() - 170.0).max(330.0)),
-        );
-        draw_skin_avatar_3d(ui.painter(), skin_texture, model_rect, palette);
-
-        let profile_y = left.bottom() - 89.0;
+        let profile_y = left.bottom() - 55.0;
         ui.painter().text(
             Pos2::new(left.center().x, profile_y),
             Align2::CENTER_CENTER,
@@ -1883,86 +1911,16 @@ impl MineLauncherApp {
             palette.muted,
         );
 
-        let apply_rect = Rect::from_center_size(
-            Pos2::new(left.center().x, left.bottom() - 38.0),
-            Vec2::new((left.width() - 12.0).min(360.0), 36.0),
-        );
-        let can_apply = can_apply_skin_source(&account.skin_source);
-        let apply_response = ui.interact(apply_rect, ui.id().with("apply_skin"), Sense::click());
-        ui.painter().rect_filled(
-            apply_rect,
-            CornerRadius::same(6),
-            if can_apply && apply_response.hovered() {
-                palette.accent_dim
-            } else {
-                palette.disabled
-            },
-        );
         ui.painter().text(
-            apply_rect.center() + Vec2::new(8.0, 0.0),
-            Align2::CENTER_CENTER,
-            "Применить",
-            FontId::proportional(13.0),
-            if can_apply {
-                palette.text
-            } else {
-                palette.muted
-            },
+            right.left_top(),
+            Align2::LEFT_TOP,
+            "Библиотека",
+            FontId::proportional(17.0),
+            palette.text,
         );
-        let check_color = if can_apply {
-            palette.text
-        } else {
-            palette.muted
-        };
-        let check_center = apply_rect.center() - Vec2::new(47.0, 0.0);
-        ui.painter().line_segment(
-            [
-                check_center + Vec2::new(-4.0, 0.0),
-                check_center + Vec2::new(-1.0, 3.0),
-            ],
-            Stroke::new(1.3, check_color),
-        );
-        ui.painter().line_segment(
-            [
-                check_center + Vec2::new(-1.0, 3.0),
-                check_center + Vec2::new(5.0, -4.0),
-            ],
-            Stroke::new(1.3, check_color),
-        );
-        if can_apply && apply_response.clicked() {
-            self.account_message =
-                "Скин применится после входа на сервер или в одиночный мир".into();
-        }
-
-        let tabs_y = right.top() + 1.0;
-        let mut tab_x = right.left();
-        for (label, selected, width) in [
-            ("Библиотека", true, 108.0),
-            ("История", false, 84.0),
-            ("Поиск", false, 72.0),
-            ("Плащи", false, 72.0),
-        ] {
-            let tab_rect = Rect::from_min_size(Pos2::new(tab_x, tabs_y), Vec2::new(width, 34.0));
-            if selected {
-                ui.painter()
-                    .rect_filled(tab_rect, CornerRadius::same(8), palette.surface);
-            }
-            ui.painter().text(
-                tab_rect.center(),
-                Align2::CENTER_CENTER,
-                label,
-                FontId::proportional(13.0),
-                if selected {
-                    palette.text
-                } else {
-                    palette.muted
-                },
-            );
-            tab_x += width + 7.0;
-        }
 
         let new_skin = Rect::from_min_size(
-            Pos2::new(right.left(), right.top() + 46.0),
+            Pos2::new(right.left(), right.top() + 42.0),
             Vec2::new(142.0, 160.0),
         );
         let new_response = ui.interact(new_skin, ui.id().with("new_skin"), Sense::click());
@@ -1999,30 +1957,6 @@ impl MineLauncherApp {
             self.skin_editor_open = true;
         }
 
-        if !account.skin_source.trim().is_empty() {
-            let saved_skin = new_skin.translate(Vec2::new(160.0, 0.0));
-            ui.painter()
-                .rect_filled(saved_skin, CornerRadius::same(8), palette.surface);
-            ui.painter().rect_stroke(
-                saved_skin,
-                CornerRadius::same(8),
-                Stroke::new(1.0, palette.border),
-                egui::StrokeKind::Inside,
-            );
-            let mini_model = Rect::from_center_size(
-                saved_skin.center() - Vec2::new(0.0, 15.0),
-                Vec2::new(84.0, 105.0),
-            );
-            draw_skin_avatar_3d(ui.painter(), skin_texture, mini_model, palette);
-            ui.painter().text(
-                saved_skin.center_bottom() - Vec2::new(0.0, 16.0),
-                Align2::CENTER_BOTTOM,
-                truncate(&account.skin_source, 18),
-                FontId::proportional(11.0),
-                palette.text,
-            );
-        }
-
         if !self.account_message.is_empty() {
             ui.painter().text(
                 Pos2::new(left.center().x, left.bottom() - 3.0),
@@ -2031,7 +1965,7 @@ impl MineLauncherApp {
                 FontId::proportional(10.5),
                 palette.accent_text,
             );
-        } else if !can_apply {
+        } else if account.skin_source.trim().is_empty() {
             ui.painter().text(
                 Pos2::new(left.center().x, left.bottom() - 3.0),
                 Align2::CENTER_BOTTOM,
@@ -2289,23 +2223,27 @@ impl MineLauncherApp {
             Pos2::new(top.right() - 27.0, top.center().y),
             Vec2::splat(28.0),
         );
-        let trash_response = ui.interact(trash, ui.id().with("clear_console"), Sense::click());
-        ui.painter().text(
-            trash.center(),
-            Align2::CENTER_CENTER,
-            "×",
-            FontId::proportional(20.0),
-            if trash_response.hovered() {
-                palette.text
-            } else {
-                palette.muted
-            },
-        );
-        if trash_response.clicked() {
-            self.launcher_log.clear();
-            self.game_log.clear();
-            let _ = std::fs::write(last_launch_log(), "");
-            self.last_log_refresh = Instant::now();
+        if !self.launcher_log.is_empty() || !self.game_log.is_empty() {
+            let trash_response = ui
+                .interact(trash, ui.id().with("clear_console"), Sense::click())
+                .on_hover_text("Очистить консоль");
+            ui.painter().text(
+                trash.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                FontId::proportional(20.0),
+                if trash_response.hovered() {
+                    palette.text
+                } else {
+                    palette.muted
+                },
+            );
+            if trash_response.clicked() {
+                self.launcher_log.clear();
+                self.game_log.clear();
+                let _ = std::fs::write(last_launch_log(), "");
+                self.last_log_refresh = Instant::now();
+            }
         }
 
         let filter_rect = Rect::from_center_size(
@@ -2385,24 +2323,11 @@ impl MineLauncherApp {
             self.ram_mb as f32 / 1024.0
         };
         ui.painter().text(
-            Pos2::new(bottom.right() - 26.0, bottom.center().y),
+            Pos2::new(bottom.right() - 8.0, bottom.center().y),
             Align2::RIGHT_CENTER,
             format!("RAM {ram:.1} GB"),
             FontId::proportional(10.5),
             palette.muted,
-        );
-        let arrow = Pos2::new(bottom.right() - 9.0, bottom.center().y);
-        ui.painter().line_segment(
-            [arrow - Vec2::new(0.0, 5.0), arrow + Vec2::new(0.0, 3.0)],
-            Stroke::new(1.2, palette.accent),
-        );
-        ui.painter().line_segment(
-            [arrow + Vec2::new(0.0, 3.0), arrow + Vec2::new(-3.0, 0.0)],
-            Stroke::new(1.2, palette.accent),
-        );
-        ui.painter().line_segment(
-            [arrow + Vec2::new(0.0, 3.0), arrow + Vec2::new(3.0, 0.0)],
-            Stroke::new(1.2, palette.accent),
         );
     }
 
@@ -3015,15 +2940,23 @@ impl MineLauncherApp {
         let mut update_requested = None;
         let mut check_requested = false;
         let mut close_requested = false;
+        let closeable = !matches!(
+            &state,
+            LauncherUpdateState::Downloading { .. } | LauncherUpdateState::Installing
+        );
 
-        egui::Window::new("Обновление MineLauncher")
+        let window = egui::Window::new("Обновление MineLauncher")
             .id(egui::Id::new("launcher_update_dialog"))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
-            .default_width(440.0)
-            .open(&mut window_open)
-            .show(ctx, |ui| {
+            .default_width(440.0);
+        let window = if closeable {
+            window.open(&mut window_open)
+        } else {
+            window
+        };
+        window.show(ctx, |ui| {
                 ui.set_width(410.0);
                 match state {
                     LauncherUpdateState::Available(ref update) => {
@@ -3269,11 +3202,6 @@ fn is_local_skin_source(source: &str) -> bool {
             || source.contains('/'))
 }
 
-fn can_apply_skin_source(source: &str) -> bool {
-    let source = source.trim();
-    is_local_skin_source(source) || source.starts_with("https://")
-}
-
 fn validate_skin_file(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Err("Выбранный файл не найден".into());
@@ -3383,13 +3311,20 @@ fn account_profile_card(
         rect.min,
         Pos2::new((rect.right() - 88.0).max(rect.left()), rect.bottom()),
     );
-    let body_response = ui
-        .interact(body_rect, id.with("activate"), Sense::click())
-        .on_hover_text(if active {
-            "Активный профиль"
+    let body_response = ui.interact(
+        body_rect,
+        id.with("activate"),
+        if active {
+            Sense::hover()
         } else {
-            "Сделать активным"
-        });
+            Sense::click()
+        },
+    );
+    let body_response = if active {
+        body_response
+    } else {
+        body_response.on_hover_text("Сделать активным")
+    };
     let edit_rect = Rect::from_center_size(
         Pos2::new(rect.right() - 58.0, rect.center().y),
         Vec2::splat(32.0),
@@ -3417,9 +3352,11 @@ fn account_profile_card(
             "Нельзя удалить единственный профиль"
         });
 
-    let hover_t =
-        ui.ctx()
-            .animate_bool_with_time(id.with("hovered"), body_response.hovered(), 0.12);
+    let hover_t = ui.ctx().animate_bool_with_time(
+        id.with("hovered"),
+        !active && body_response.hovered(),
+        0.12,
+    );
     let fill = if hover_t > 0.0 {
         mix_color(palette.surface, palette.progress_track, hover_t * 0.72)
     } else {
@@ -3715,9 +3652,9 @@ fn side_button(
     let selected_t = ui
         .ctx()
         .animate_bool_with_time(id.with("selected"), selected, 0.18);
-    let hover_t = ui
-        .ctx()
-        .animate_bool_with_time(id.with("hovered"), response.hovered(), 0.12);
+    let hover_t =
+        ui.ctx()
+            .animate_bool_with_time(id.with("hovered"), enabled && response.hovered(), 0.12);
 
     if selected_t > 0.0 {
         ui.painter().rect_filled(
@@ -3790,61 +3727,6 @@ fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
         channel(from.b(), to.b()),
         channel(from.a(), to.a()),
     )
-}
-
-fn draw_eye_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
-    painter.line_segment(
-        [
-            center + Vec2::new(-7.0, 0.0),
-            center + Vec2::new(-2.5, -3.5),
-        ],
-        Stroke::new(1.1, color),
-    );
-    painter.line_segment(
-        [
-            center + Vec2::new(-2.5, -3.5),
-            center + Vec2::new(2.5, -3.5),
-        ],
-        Stroke::new(1.1, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(2.5, -3.5), center + Vec2::new(7.0, 0.0)],
-        Stroke::new(1.1, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(7.0, 0.0), center + Vec2::new(2.5, 3.5)],
-        Stroke::new(1.1, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(2.5, 3.5), center + Vec2::new(-2.5, 3.5)],
-        Stroke::new(1.1, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(-2.5, 3.5), center + Vec2::new(-7.0, 0.0)],
-        Stroke::new(1.1, color),
-    );
-    painter.circle_filled(center, 2.0, color);
-}
-
-fn draw_shirt_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
-    let points = [
-        center + Vec2::new(-7.0, -5.0),
-        center + Vec2::new(-3.0, -7.0),
-        center + Vec2::new(-1.5, -3.0),
-        center + Vec2::new(1.5, -3.0),
-        center + Vec2::new(3.0, -7.0),
-        center + Vec2::new(7.0, -5.0),
-        center + Vec2::new(5.0, 0.0),
-        center + Vec2::new(3.5, -1.0),
-        center + Vec2::new(3.5, 7.0),
-        center + Vec2::new(-3.5, 7.0),
-        center + Vec2::new(-3.5, -1.0),
-        center + Vec2::new(-5.0, 0.0),
-        center + Vec2::new(-7.0, -5.0),
-    ];
-    for segment in points.windows(2) {
-        painter.line_segment([segment[0], segment[1]], Stroke::new(1.1, color));
-    }
 }
 
 fn draw_logo(painter: &egui::Painter, rect: Rect) {
@@ -4006,186 +3888,380 @@ fn load_skin_texture_from_bytes(
     ))
 }
 
-#[derive(Clone, Copy)]
-struct SkinFaces {
-    front: [f32; 4],
-    right: [f32; 4],
+const SKIN_TEXTURE_SIZE: f32 = 64.0;
+const SKIN_CAMERA_PITCH: f32 = 0.22;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SkinPoint3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl SkinPoint3 {
+    const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SkinFaceUvs {
     top: [f32; 4],
+    bottom: [f32; 4],
+    negative_x: [f32; 4],
+    front: [f32; 4],
+    positive_x: [f32; 4],
+    back: [f32; 4],
+}
+
+fn skin_face_uvs(u: f32, v: f32, width: f32, height: f32, depth: f32) -> SkinFaceUvs {
+    SkinFaceUvs {
+        top: [u + depth, v, u + depth + width, v + depth],
+        bottom: [u + depth + width, v, u + depth + width * 2.0, v + depth],
+        negative_x: [u, v + depth, u + depth, v + depth + height],
+        front: [u + depth, v + depth, u + depth + width, v + depth + height],
+        positive_x: [
+            u + depth + width,
+            v + depth,
+            u + depth * 2.0 + width,
+            v + depth + height,
+        ],
+        back: [
+            u + depth * 2.0 + width,
+            v + depth,
+            u + depth * 2.0 + width * 2.0,
+            v + depth + height,
+        ],
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SkinCuboid {
+    min: SkinPoint3,
+    max: SkinPoint3,
+    base_uvs: SkinFaceUvs,
+    overlay_uvs: SkinFaceUvs,
+    overlay_expand: f32,
+}
+
+fn skin_cuboids(model: SkinModel) -> [SkinCuboid; 6] {
+    let arm_width = match model {
+        SkinModel::Classic => 4.0,
+        SkinModel::Slim => 3.0,
+    };
+    [
+        SkinCuboid {
+            min: SkinPoint3::new(-4.0, 24.0, -4.0),
+            max: SkinPoint3::new(4.0, 32.0, 4.0),
+            base_uvs: skin_face_uvs(0.0, 0.0, 8.0, 8.0, 8.0),
+            overlay_uvs: skin_face_uvs(32.0, 0.0, 8.0, 8.0, 8.0),
+            overlay_expand: 0.5,
+        },
+        SkinCuboid {
+            min: SkinPoint3::new(-4.0, 12.0, -2.0),
+            max: SkinPoint3::new(4.0, 24.0, 2.0),
+            base_uvs: skin_face_uvs(16.0, 16.0, 8.0, 12.0, 4.0),
+            overlay_uvs: skin_face_uvs(16.0, 32.0, 8.0, 12.0, 4.0),
+            overlay_expand: 0.25,
+        },
+        SkinCuboid {
+            min: SkinPoint3::new(-4.0 - arm_width, 12.0, -2.0),
+            max: SkinPoint3::new(-4.0, 24.0, 2.0),
+            base_uvs: skin_face_uvs(40.0, 16.0, arm_width, 12.0, 4.0),
+            overlay_uvs: skin_face_uvs(40.0, 32.0, arm_width, 12.0, 4.0),
+            overlay_expand: 0.25,
+        },
+        SkinCuboid {
+            min: SkinPoint3::new(4.0, 12.0, -2.0),
+            max: SkinPoint3::new(4.0 + arm_width, 24.0, 2.0),
+            base_uvs: skin_face_uvs(32.0, 48.0, arm_width, 12.0, 4.0),
+            overlay_uvs: skin_face_uvs(48.0, 48.0, arm_width, 12.0, 4.0),
+            overlay_expand: 0.25,
+        },
+        SkinCuboid {
+            min: SkinPoint3::new(-4.0, 0.0, -2.0),
+            max: SkinPoint3::new(0.0, 12.0, 2.0),
+            base_uvs: skin_face_uvs(0.0, 16.0, 4.0, 12.0, 4.0),
+            overlay_uvs: skin_face_uvs(0.0, 32.0, 4.0, 12.0, 4.0),
+            overlay_expand: 0.25,
+        },
+        SkinCuboid {
+            min: SkinPoint3::new(0.0, 0.0, -2.0),
+            max: SkinPoint3::new(4.0, 12.0, 2.0),
+            base_uvs: skin_face_uvs(16.0, 48.0, 4.0, 12.0, 4.0),
+            overlay_uvs: skin_face_uvs(0.0, 48.0, 4.0, 12.0, 4.0),
+            overlay_expand: 0.25,
+        },
+    ]
+}
+
+#[derive(Clone, Copy)]
+enum SkinFace {
+    Top,
+    Bottom,
+    NegativeX,
+    Front,
+    PositiveX,
+    Back,
+}
+
+impl SkinFace {
+    const ALL: [Self; 6] = [
+        Self::Top,
+        Self::Bottom,
+        Self::NegativeX,
+        Self::Front,
+        Self::PositiveX,
+        Self::Back,
+    ];
+
+    fn normal(self) -> SkinPoint3 {
+        match self {
+            Self::Top => SkinPoint3::new(0.0, 1.0, 0.0),
+            Self::Bottom => SkinPoint3::new(0.0, -1.0, 0.0),
+            Self::NegativeX => SkinPoint3::new(-1.0, 0.0, 0.0),
+            Self::Front => SkinPoint3::new(0.0, 0.0, 1.0),
+            Self::PositiveX => SkinPoint3::new(1.0, 0.0, 0.0),
+            Self::Back => SkinPoint3::new(0.0, 0.0, -1.0),
+        }
+    }
+
+    fn uvs(self, uvs: SkinFaceUvs) -> [f32; 4] {
+        match self {
+            Self::Top => uvs.top,
+            Self::Bottom => uvs.bottom,
+            Self::NegativeX => uvs.negative_x,
+            Self::Front => uvs.front,
+            Self::PositiveX => uvs.positive_x,
+            Self::Back => uvs.back,
+        }
+    }
+
+    fn corners(self, min: SkinPoint3, max: SkinPoint3) -> [SkinPoint3; 4] {
+        match self {
+            Self::Top => [
+                SkinPoint3::new(min.x, max.y, min.z),
+                SkinPoint3::new(max.x, max.y, min.z),
+                SkinPoint3::new(min.x, max.y, max.z),
+                SkinPoint3::new(max.x, max.y, max.z),
+            ],
+            Self::Bottom => [
+                SkinPoint3::new(min.x, min.y, min.z),
+                SkinPoint3::new(max.x, min.y, min.z),
+                SkinPoint3::new(min.x, min.y, max.z),
+                SkinPoint3::new(max.x, min.y, max.z),
+            ],
+            Self::NegativeX => [
+                SkinPoint3::new(min.x, max.y, min.z),
+                SkinPoint3::new(min.x, max.y, max.z),
+                SkinPoint3::new(min.x, min.y, min.z),
+                SkinPoint3::new(min.x, min.y, max.z),
+            ],
+            Self::Front => [
+                SkinPoint3::new(min.x, max.y, max.z),
+                SkinPoint3::new(max.x, max.y, max.z),
+                SkinPoint3::new(min.x, min.y, max.z),
+                SkinPoint3::new(max.x, min.y, max.z),
+            ],
+            Self::PositiveX => [
+                SkinPoint3::new(max.x, max.y, max.z),
+                SkinPoint3::new(max.x, max.y, min.z),
+                SkinPoint3::new(max.x, min.y, max.z),
+                SkinPoint3::new(max.x, min.y, min.z),
+            ],
+            Self::Back => [
+                SkinPoint3::new(max.x, max.y, min.z),
+                SkinPoint3::new(min.x, max.y, min.z),
+                SkinPoint3::new(max.x, min.y, min.z),
+                SkinPoint3::new(min.x, min.y, min.z),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SkinCameraPoint {
+    horizontal: f32,
+    vertical: f32,
+    depth: f32,
+}
+
+fn skin_camera_point(point: SkinPoint3, yaw: f32) -> SkinCameraPoint {
+    let (yaw_sin, yaw_cos) = yaw.sin_cos();
+    let rotated_x = point.x * yaw_cos + point.z * yaw_sin;
+    let rotated_z = -point.x * yaw_sin + point.z * yaw_cos;
+    let (pitch_sin, pitch_cos) = SKIN_CAMERA_PITCH.sin_cos();
+    SkinCameraPoint {
+        horizontal: rotated_x,
+        vertical: point.y * pitch_cos - rotated_z * pitch_sin,
+        depth: point.y * pitch_sin + rotated_z * pitch_cos,
+    }
+}
+
+fn normalize_skin_yaw(yaw: f32) -> f32 {
+    if yaw.is_finite() {
+        yaw.rem_euclid(std::f32::consts::TAU)
+    } else {
+        0.0
+    }
+}
+
+fn expanded_skin_cuboid(cuboid: SkinCuboid, expand: f32) -> (SkinPoint3, SkinPoint3) {
+    (
+        SkinPoint3::new(
+            cuboid.min.x - expand,
+            cuboid.min.y - expand,
+            cuboid.min.z - expand,
+        ),
+        SkinPoint3::new(
+            cuboid.max.x + expand,
+            cuboid.max.y + expand,
+            cuboid.max.z + expand,
+        ),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SkinProjection {
+    center: Pos2,
+    horizontal_center: f32,
+    vertical_center: f32,
+    scale: f32,
+    yaw: f32,
+}
+
+impl SkinProjection {
+    fn project(self, point: SkinPoint3) -> (Pos2, f32) {
+        let camera = skin_camera_point(point, self.yaw);
+        (
+            Pos2::new(
+                self.center.x + (camera.horizontal - self.horizontal_center) * self.scale,
+                self.center.y - (camera.vertical - self.vertical_center) * self.scale,
+            ),
+            camera.depth,
+        )
+    }
+}
+
+fn skin_projection(rect: Rect, cuboids: &[SkinCuboid; 6], yaw: f32) -> SkinProjection {
+    let mut min_horizontal = f32::INFINITY;
+    let mut max_horizontal = f32::NEG_INFINITY;
+    let mut min_vertical = f32::INFINITY;
+    let mut max_vertical = f32::NEG_INFINITY;
+    for cuboid in cuboids {
+        let (min, max) = expanded_skin_cuboid(*cuboid, cuboid.overlay_expand);
+        for x in [min.x, max.x] {
+            for y in [min.y, max.y] {
+                for z in [min.z, max.z] {
+                    let point = skin_camera_point(SkinPoint3::new(x, y, z), yaw);
+                    min_horizontal = min_horizontal.min(point.horizontal);
+                    max_horizontal = max_horizontal.max(point.horizontal);
+                    min_vertical = min_vertical.min(point.vertical);
+                    max_vertical = max_vertical.max(point.vertical);
+                }
+            }
+        }
+    }
+    let model_width = (max_horizontal - min_horizontal).max(1.0);
+    let model_height = (max_vertical - min_vertical).max(1.0);
+    let scale = (rect.width() / model_width).min(rect.height() / model_height) * 0.92;
+    SkinProjection {
+        center: rect.center(),
+        horizontal_center: (min_horizontal + max_horizontal) * 0.5,
+        vertical_center: (min_vertical + max_vertical) * 0.5,
+        scale,
+        yaw,
+    }
+}
+
+struct SkinRenderFace {
+    points: [Pos2; 4],
+    uvs: [f32; 4],
+    depth: f32,
+    tint: Color32,
+}
+
+fn collect_skin_cuboid_faces(
+    output: &mut Vec<SkinRenderFace>,
+    cuboid: SkinCuboid,
+    uvs: SkinFaceUvs,
+    expand: f32,
+    projection: SkinProjection,
+) {
+    let (min, max) = expanded_skin_cuboid(cuboid, expand);
+    for face in SkinFace::ALL {
+        let normal = face.normal();
+        let normal_depth = skin_camera_point(normal, projection.yaw).depth;
+        if normal_depth <= 0.0001 {
+            continue;
+        }
+
+        let corners = face.corners(min, max);
+        let mut points = [Pos2::ZERO; 4];
+        let mut average_depth = 0.0;
+        for (index, corner) in corners.into_iter().enumerate() {
+            let (point, depth) = projection.project(corner);
+            points[index] = point;
+            average_depth += depth * 0.25;
+        }
+        let brightness = (0.76 + normal_depth * 0.18 + normal.y.max(0.0) * 0.08).clamp(0.72, 1.0);
+        let channel = (brightness * 255.0).round() as u8;
+        output.push(SkinRenderFace {
+            points,
+            uvs: face.uvs(uvs),
+            depth: average_depth,
+            tint: Color32::from_rgb(channel, channel, channel),
+        });
+    }
 }
 
 fn draw_skin_avatar_3d(
     painter: &egui::Painter,
     texture: egui::TextureId,
     rect: Rect,
+    model: SkinModel,
+    yaw: f32,
     _palette: Palette,
 ) {
-    // Minecraft's classic model is 16 px wide and 32 px tall. Keep those exact
-    // proportions and only add a small isometric depth so the preview reads as 3D.
-    let unit = (rect.height() / 34.0)
-        .min(rect.width() / 18.0)
-        .clamp(1.7, 10.5);
-    let depth = unit * 1.25;
-    let model_size = Vec2::new(unit * 16.0 + depth, unit * 32.0 + depth * 0.55);
-    let origin = rect.center() - model_size * 0.5 + Vec2::new(-depth * 0.15, depth * 0.28);
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
 
+    let yaw = normalize_skin_yaw(yaw);
+    let cuboids = skin_cuboids(model);
+    let projection = skin_projection(rect, &cuboids, yaw);
+    let (feet, _) = projection.project(SkinPoint3::new(0.0, -0.45, 0.0));
     let shadow = Rect::from_center_size(
-        Pos2::new(
-            rect.center().x + depth * 0.35,
-            origin.y + unit * 32.0 + depth * 0.2,
-        ),
-        Vec2::new(unit * 12.5, unit * 1.25),
+        feet + Vec2::new(0.0, projection.scale * 0.3),
+        Vec2::new(projection.scale * 11.0, projection.scale * 1.25),
     );
     painter.rect_filled(
         shadow,
-        CornerRadius::same((unit * 0.6).round().clamp(1.0, 255.0) as u8),
-        Color32::from_rgba_unmultiplied(0, 0, 0, 72),
+        CornerRadius::same((projection.scale * 0.7).round().clamp(1.0, 255.0) as u8),
+        Color32::from_black_alpha(64),
     );
 
-    let head = Rect::from_min_size(origin + Vec2::new(unit * 4.0, 0.0), Vec2::splat(unit * 8.0));
-    let body = Rect::from_min_size(
-        origin + Vec2::new(unit * 4.0, unit * 8.0),
-        Vec2::new(unit * 8.0, unit * 12.0),
-    );
-    let screen_left_arm = Rect::from_min_size(
-        origin + Vec2::new(0.0, unit * 8.0),
-        Vec2::new(unit * 4.0, unit * 12.0),
-    );
-    let screen_right_arm = Rect::from_min_size(
-        origin + Vec2::new(unit * 12.0, unit * 8.0),
-        Vec2::new(unit * 4.0, unit * 12.0),
-    );
-    let screen_left_leg = Rect::from_min_size(
-        origin + Vec2::new(unit * 4.0, unit * 20.0),
-        Vec2::new(unit * 4.0, unit * 12.0),
-    );
-    let screen_right_leg = Rect::from_min_size(
-        origin + Vec2::new(unit * 8.0, unit * 20.0),
-        Vec2::new(unit * 4.0, unit * 12.0),
-    );
+    let mut faces = Vec::with_capacity(36);
+    for cuboid in cuboids {
+        collect_skin_cuboid_faces(&mut faces, cuboid, cuboid.base_uvs, 0.0, projection);
+        collect_skin_cuboid_faces(
+            &mut faces,
+            cuboid,
+            cuboid.overlay_uvs,
+            cuboid.overlay_expand,
+            projection,
+        );
+    }
+    faces.sort_by(|left, right| {
+        left.depth
+            .partial_cmp(&right.depth)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    // Render the outer face of each arm away from the torso. Using the same
-    // depth direction for both arms makes the left arm fold into the body.
-    draw_skin_cuboid(
-        painter,
-        texture,
-        screen_right_arm,
-        depth * 0.52,
-        SkinFaces {
-            front: [36.0, 52.0, 40.0, 64.0],
-            right: [40.0, 52.0, 44.0, 64.0],
-            top: [36.0, 48.0, 40.0, 52.0],
-        },
-    );
-    draw_skin_cuboid(
-        painter,
-        texture,
-        screen_right_leg,
-        depth * 0.52,
-        SkinFaces {
-            front: [20.0, 52.0, 24.0, 64.0],
-            right: [16.0, 52.0, 20.0, 64.0],
-            top: [20.0, 48.0, 24.0, 52.0],
-        },
-    );
-    draw_skin_cuboid(
-        painter,
-        texture,
-        screen_left_leg,
-        depth * 0.52,
-        SkinFaces {
-            front: [4.0, 20.0, 8.0, 32.0],
-            right: [0.0, 20.0, 4.0, 32.0],
-            top: [4.0, 16.0, 8.0, 20.0],
-        },
-    );
-    draw_skin_cuboid(
-        painter,
-        texture,
-        body,
-        depth,
-        SkinFaces {
-            front: [20.0, 20.0, 28.0, 32.0],
-            right: [16.0, 20.0, 20.0, 32.0],
-            top: [20.0, 16.0, 28.0, 20.0],
-        },
-    );
-    draw_skin_cuboid(
-        painter,
-        texture,
-        screen_left_arm,
-        -depth * 0.52,
-        SkinFaces {
-            front: [44.0, 20.0, 48.0, 32.0],
-            right: [40.0, 20.0, 44.0, 32.0],
-            top: [44.0, 16.0, 48.0, 20.0],
-        },
-    );
-    draw_skin_cuboid(
-        painter,
-        texture,
-        head,
-        depth,
-        SkinFaces {
-            front: [8.0, 8.0, 16.0, 16.0],
-            right: [0.0, 8.0, 8.0, 16.0],
-            top: [8.0, 0.0, 16.0, 8.0],
-        },
-    );
-}
-
-fn draw_skin_cuboid(
-    painter: &egui::Painter,
-    texture: egui::TextureId,
-    front: Rect,
-    depth: f32,
-    faces: SkinFaces,
-) {
-    let offset = Vec2::new(depth, -depth.abs() * 0.55);
     let mut mesh = egui::Mesh::with_texture(texture);
-
-    add_skin_quad(
-        &mut mesh,
-        [
-            front.left_top() + offset,
-            front.right_top() + offset,
-            front.left_top(),
-            front.right_top(),
-        ],
-        faces.top,
-        Color32::WHITE,
-    );
-    let side = if depth >= 0.0 {
-        [
-            front.right_top(),
-            front.right_top() + offset,
-            front.right_bottom(),
-            front.right_bottom() + offset,
-        ]
-    } else {
-        [
-            front.left_top() + offset,
-            front.left_top(),
-            front.left_bottom() + offset,
-            front.left_bottom(),
-        ]
-    };
-    add_skin_quad(
-        &mut mesh,
-        side,
-        faces.right,
-        Color32::from_rgb(174, 174, 174),
-    );
-    add_skin_quad(
-        &mut mesh,
-        [
-            front.left_top(),
-            front.right_top(),
-            front.left_bottom(),
-            front.right_bottom(),
-        ],
-        faces.front,
-        Color32::WHITE,
-    );
+    for face in faces {
+        add_skin_quad(&mut mesh, face.points, face.uvs, face.tint);
+    }
     painter.add(egui::Shape::mesh(mesh));
 }
 
@@ -4198,10 +4274,10 @@ fn add_skin_quad(
     let index = mesh.vertices.len() as u32;
     let [u0, v0, u1, v1] = texture_pixels;
     let uvs = [
-        Pos2::new(u0 / 64.0, v0 / 64.0),
-        Pos2::new(u1 / 64.0, v0 / 64.0),
-        Pos2::new(u0 / 64.0, v1 / 64.0),
-        Pos2::new(u1 / 64.0, v1 / 64.0),
+        Pos2::new(u0 / SKIN_TEXTURE_SIZE, v0 / SKIN_TEXTURE_SIZE),
+        Pos2::new(u1 / SKIN_TEXTURE_SIZE, v0 / SKIN_TEXTURE_SIZE),
+        Pos2::new(u0 / SKIN_TEXTURE_SIZE, v1 / SKIN_TEXTURE_SIZE),
+        Pos2::new(u1 / SKIN_TEXTURE_SIZE, v1 / SKIN_TEXTURE_SIZE),
     ];
     for (pos, uv) in points.into_iter().zip(uvs) {
         mesh.vertices.push(egui::epaint::Vertex {
@@ -4524,4 +4600,41 @@ fn configure_style(ctx: &egui::Context, theme: Theme) {
     visuals.selection.bg_fill = palette.accent;
     visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skin_yaw_wraps_across_a_full_turn() {
+        let tau = std::f32::consts::TAU;
+        assert!((normalize_skin_yaw(tau + 0.4) - 0.4).abs() < 0.0001);
+        assert!((normalize_skin_yaw(-0.4) - (tau - 0.4)).abs() < 0.0001);
+        assert_eq!(normalize_skin_yaw(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn slim_geometry_uses_three_pixel_arms() {
+        let classic = skin_cuboids(SkinModel::Classic);
+        let slim = skin_cuboids(SkinModel::Slim);
+        assert_eq!(classic.len(), 6);
+        assert_eq!(classic[2].max.x - classic[2].min.x, 4.0);
+        assert_eq!(classic[3].max.x - classic[3].min.x, 4.0);
+        assert_eq!(slim[2].max.x - slim[2].min.x, 3.0);
+        assert_eq!(slim[3].max.x - slim[3].min.x, 3.0);
+        assert_eq!(slim[2].max.x, -4.0);
+        assert_eq!(slim[3].min.x, 4.0);
+    }
+
+    #[test]
+    fn slim_arm_uvs_cover_all_six_canonical_faces() {
+        let uvs = skin_face_uvs(40.0, 16.0, 3.0, 12.0, 4.0);
+        assert_eq!(uvs.top, [44.0, 16.0, 47.0, 20.0]);
+        assert_eq!(uvs.bottom, [47.0, 16.0, 50.0, 20.0]);
+        assert_eq!(uvs.negative_x, [40.0, 20.0, 44.0, 32.0]);
+        assert_eq!(uvs.front, [44.0, 20.0, 47.0, 32.0]);
+        assert_eq!(uvs.positive_x, [47.0, 20.0, 51.0, 32.0]);
+        assert_eq!(uvs.back, [51.0, 20.0, 54.0, 32.0]);
+    }
 }
